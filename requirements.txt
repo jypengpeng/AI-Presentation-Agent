@@ -1,0 +1,12 @@
+# Core dependencies
+openai>=1.0.0
+streamlit>=1.28.0
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0  # For loading .env configuration
+
+# Data processing (for inspect_csv_head tool)
+pandas>=2.0.0
+tabulate>=0.9.0  # Required for pandas.to_markdown()
+
+# Optional but recommended
+lxml>=4.9.0
