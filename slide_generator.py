@@ -16,6 +16,7 @@ import os
 import json
 import asyncio
 import re
+import zipfile
 from pathlib import Path
 from typing import Optional, Callable, Any, Generator
 from dataclasses import dataclass, field
@@ -195,7 +196,7 @@ SLIDE_TEMPLATE = """<!DOCTYPE html>
 
 
 # ============================================================================
-# Exported Single File Template
+# Exported Single File Template (iframe-based loader)
 # ============================================================================
 
 EXPORTED_HTML_TEMPLATE = """<!DOCTYPE html>
@@ -205,86 +206,159 @@ EXPORTED_HTML_TEMPLATE = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title}</title>
     
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
     <style>
-        html, body {{
+        * {{
             margin: 0;
             padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        html, body {{
             width: 100vw;
             height: 100vh;
             overflow: hidden;
             font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: white;
         }}
         
-        .slide {{
-            position: absolute;
-            inset: 0;
+        #slide-frame {{
             width: 100%;
             height: 100%;
+            border: none;
+            background: white;
         }}
         
-        .slide.hidden {{
-            display: none;
+        #slide-indicator {{
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            color: #9ca3af;
+            font-size: 14px;
+            font-weight: 400;
+            z-index: 1000;
+            pointer-events: none;
+        }}
+        
+        #loading {{
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            z-index: 999;
+            transition: opacity 0.3s;
+        }}
+        
+        #loading.hidden {{
+            opacity: 0;
+            pointer-events: none;
+        }}
+        
+        .spinner {{
+            width: 40px;
+            height: 40px;
+            border: 3px solid #e5e7eb;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }}
+        
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
         }}
     </style>
 </head>
-<body class="bg-white">
-    <main id="presentation-deck" class="relative w-full h-full">
-        {slides_content}
-    </main>
-    
-    <!-- Navigation Indicator -->
-    <div id="slide-indicator" class="fixed bottom-4 right-4 text-sm text-gray-400">
-        1 / {total_slides}
+<body>
+    <!-- Loading indicator -->
+    <div id="loading">
+        <div class="spinner"></div>
     </div>
     
-    <!-- Navigation Script -->
+    <!-- Slide iframe -->
+    <iframe id="slide-frame" src=""></iframe>
+    
+    <!-- Slide indicator -->
+    <div id="slide-indicator">1 / {total_slides}</div>
+    
     <script>
-        let currentSlideIndex = 0;
-        const slides = document.querySelectorAll('.slide');
+        // Slide configuration
+        const slides = {slides_json};
         const totalSlides = slides.length;
-        const indicator = document.getElementById('slide-indicator');
+        let currentSlideIndex = 0;
         
-        function showSlide(index) {{
-            slides.forEach((slide, i) => {{
-                if (i === index) {{
-                    slide.classList.remove('hidden');
-                }} else {{
-                    slide.classList.add('hidden');
-                }}
-            }});
+        // DOM elements
+        const frame = document.getElementById('slide-frame');
+        const indicator = document.getElementById('slide-indicator');
+        const loading = document.getElementById('loading');
+        
+        // Load a slide
+        function loadSlide(index) {{
+            if (index < 0 || index >= totalSlides) return;
+            
+            loading.classList.remove('hidden');
+            currentSlideIndex = index;
+            
+            // Update iframe src
+            frame.src = slides[index].file;
+            
+            // Update indicator
             indicator.textContent = `${{index + 1}} / ${{totalSlides}}`;
         }}
         
+        // Navigation functions
         function nextSlide() {{
             if (currentSlideIndex < totalSlides - 1) {{
-                currentSlideIndex++;
-                showSlide(currentSlideIndex);
+                loadSlide(currentSlideIndex + 1);
             }}
         }}
         
         function prevSlide() {{
             if (currentSlideIndex > 0) {{
-                currentSlideIndex--;
-                showSlide(currentSlideIndex);
+                loadSlide(currentSlideIndex - 1);
             }}
         }}
         
+        // Toggle fullscreen
+        function toggleFullscreen() {{
+            if (!document.fullscreenElement) {{
+                document.documentElement.requestFullscreen().catch(err => {{
+                    console.log('Fullscreen error:', err);
+                }});
+            }} else {{
+                document.exitFullscreen();
+            }}
+        }}
+        
+        // Keyboard navigation
         document.addEventListener('keydown', (e) => {{
-            if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Enter') {{
+            if (e.key === 'ArrowRight' || e.key === ' ') {{
+                e.preventDefault();
                 nextSlide();
             }} else if (e.key === 'ArrowLeft') {{
+                e.preventDefault();
                 prevSlide();
+            }} else if (e.key === 'Enter' || e.key === 'F' || e.key === 'f') {{
+                e.preventDefault();
+                toggleFullscreen();
+            }} else if (e.key === 'Home') {{
+                e.preventDefault();
+                loadSlide(0);
+            }} else if (e.key === 'End') {{
+                e.preventDefault();
+                loadSlide(totalSlides - 1);
+            }} else if (e.key === 'Escape' && document.fullscreenElement) {{
+                // Escape is handled by browser for fullscreen exit
             }}
         }});
         
-        // Initialize
-        showSlide(0);
+        // Hide loading when iframe loads
+        frame.addEventListener('load', () => {{
+            loading.classList.add('hidden');
+        }});
+        
+        // Initialize - load first slide
+        loadSlide(0);
     </script>
 </body>
 </html>
@@ -519,7 +593,7 @@ class SlideGenerator:
         
         Args:
             slide_data: The slide's data from the plan (id, title, content)
-            agent_tools_json: Tool definitions
+            agent_tools_json: Tool definitions (should include generate_image for Designer)
         
         Returns:
             Complete system prompt for Designer role
@@ -732,17 +806,18 @@ class SlideGenerator:
                 # Update manifest to generating
                 self._update_manifest_status(slides_dir, slide_id, "generating")
                 
-                # Create a new Designer agent
+                # Create a new Designer agent with image generation capability
                 from agent_core import Agent
                 
                 logger.debug(f"[{slide_id}] Creating temp agent for tool definitions...")
                 
-                # Get tool definitions (we need an agent instance for this)
+                # Get tool definitions with generate_image enabled (Designer-only tool)
                 temp_agent = Agent(
                     api_key=self.api_key,
                     workspace_dir=str(self.workspace_dir),
                     model=self.model,
-                    base_url=self.base_url
+                    base_url=self.base_url,
+                    include_image_tool=True  # Enable image generation for Designer
                 )
                 tools_json = temp_agent.tools.get_tool_definitions_json()
                 
@@ -840,13 +915,17 @@ class SlideGenerator:
     # Phase 4: Export - Merge to Single File
     # =========================================================================
     
-    def export_to_single_file(self, slides_dir: Path, output_path: Optional[Path] = None) -> Path:
+    def export_to_single_file(self, slides_dir: Path, output_path: Optional[Path] = None, slides_path_prefix: str = "../slides/") -> Path:
         """
-        Merge all slide HTML files into a single presentation file.
+        Create a presentation loader that dynamically loads slide HTML files via iframe.
+        
+        This approach preserves all CSS, JS, and content from individual slides,
+        avoiding the issues with content extraction and merging.
         
         Args:
             slides_dir: Directory containing slide HTML files
             output_path: Optional output path (default: exported/presentation.html)
+            slides_path_prefix: Prefix for slide file paths (default: "../slides/" for exported folder)
         
         Returns:
             Path to the exported file
@@ -864,49 +943,133 @@ class SlideGenerator:
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         slides_meta = manifest.get("slides", [])
         
-        # Extract content from each slide
-        slides_content = []
+        # Build slides array for JavaScript
+        slides_json = json.dumps([
+            {
+                "id": slide.get("id", f"slide_{i+1}"),
+                "title": slide.get("title", f"Slide {i+1}"),
+                "file": f"{slides_path_prefix}{slide.get('file', f'slide_{i+1}.html')}"
+            }
+            for i, slide in enumerate(slides_meta)
+        ], ensure_ascii=False)
         
-        for i, slide_meta in enumerate(slides_meta):
-            slide_file = slides_dir / slide_meta.get("file", "")
-            
-            if not slide_file.exists():
-                logger.warning(f"Slide file not found: {slide_file}")
-                continue
-            
-            html_content = slide_file.read_text(encoding='utf-8')
-            
-            # Extract content between <div id="content"> and </div>
-            content_match = re.search(
-                r'<div id="content"[^>]*>(.*?)</div>\s*(?=<!--\s*Navigation Script|<script>)',
-                html_content,
-                re.DOTALL
-            )
-            
-            if content_match:
-                inner_content = content_match.group(1).strip()
-            else:
-                # Fallback: try to get the whole body content
-                inner_content = f'<div class="h-full flex items-center justify-center"><p>Slide {i + 1}</p></div>'
-            
-            # Wrap in section
-            hidden_class = "hidden" if i > 0 else ""
-            slides_content.append(
-                f'<section class="slide {hidden_class}" data-slide="{i + 1}">\n{inner_content}\n</section>'
-            )
-        
-        # Get title from manifest or first slide
+        # Get title from manifest
         title = manifest.get("title", slides_meta[0].get("title", "Presentation") if slides_meta else "Presentation")
         
         # Generate exported HTML
         exported_html = EXPORTED_HTML_TEMPLATE.format(
             title=title,
-            slides_content="\n\n".join(slides_content),
-            total_slides=len(slides_content)
+            slides_json=slides_json,
+            total_slides=len(slides_meta)
         )
         
         output_path.write_text(exported_html, encoding='utf-8')
         logger.info(f"Exported presentation to: {output_path}")
+        
+        return output_path
+    
+    def create_zip_package(self, slides_dir: Path, output_path: Optional[Path] = None) -> Path:
+        """
+        Create a ZIP package containing the presentation and all slides.
+        
+        The ZIP structure:
+        - presentation.html (main file to open)
+        - slides/ (all slide HTML files)
+        - README.md (keyboard shortcuts guide)
+        
+        Args:
+            slides_dir: Directory containing slide HTML files
+            output_path: Optional output path for the ZIP file
+        
+        Returns:
+            Path to the created ZIP file
+        """
+        import tempfile
+        
+        export_dir = self.workspace_dir / "exported"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Determine output path
+        if output_path is None:
+            output_path = export_dir / "presentation.zip"
+        
+        # Read manifest for title
+        manifest_path = slides_dir / "manifest.json"
+        title = "Presentation"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                title = manifest.get("title", "Presentation")
+            except:
+                pass
+        
+        # Generate presentation.html with correct paths for ZIP structure
+        # In ZIP: presentation.html and slides/ are in the same directory
+        # So we use "slides/" instead of "../slides/"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as tmp:
+            tmp_path = Path(tmp.name)
+        
+        self.export_to_single_file(slides_dir, output_path=tmp_path, slides_path_prefix="slides/")
+        
+        # Create README content
+        readme_content = f"""# {title}
+
+## 使用说明
+
+打开 `presentation.html` 文件即可开始演示。
+
+## 键盘快捷键
+
+| 按键 | 功能 |
+|------|------|
+| ← | 上一页 |
+| → | 下一页 |
+| 空格 | 下一页 |
+| Enter | 切换全屏 |
+| F | 切换全屏 |
+| Esc | 退出全屏 |
+| Home | 跳到第一页 |
+| End | 跳到最后一页 |
+
+## 文件结构
+
+```
+├── presentation.html    # 主文件，打开此文件开始演示
+├── slides/              # 幻灯片文件目录
+│   ├── slide_1.html
+│   ├── slide_2.html
+│   └── ...
+└── README.md            # 本说明文件
+```
+
+## 注意事项
+
+- 请确保 `slides` 文件夹与 `presentation.html` 在同一目录下
+- 建议使用现代浏览器（Chrome、Firefox、Edge）打开
+- 如需编辑单个幻灯片，可直接修改 `slides` 文件夹中的 HTML 文件
+"""
+        
+        # Create ZIP file
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add presentation.html (with correct paths for ZIP structure)
+            zf.write(tmp_path, 'presentation.html')
+            
+            # Add README.md
+            zf.writestr('README.md', readme_content)
+            
+            # Add all files from slides directory
+            for file_path in slides_dir.iterdir():
+                if file_path.is_file():
+                    arcname = f'slides/{file_path.name}'
+                    zf.write(file_path, arcname)
+        
+        # Clean up temp file
+        try:
+            tmp_path.unlink()
+        except:
+            pass
+        
+        logger.info(f"Created ZIP package: {output_path}")
         
         return output_path
     
@@ -980,14 +1143,15 @@ class SlideGenerator:
         else:
             task = self.create_designer_task(slide_id, relative_path)
         
-        # Create and run Designer agent
+        # Create and run Designer agent with image generation capability
         if create_agent_func:
             from agent_core import Agent
             temp_agent = Agent(
                 api_key=self.api_key,
                 workspace_dir=str(self.workspace_dir),
                 model=self.model,
-                base_url=self.base_url
+                base_url=self.base_url,
+                include_image_tool=True  # Enable image generation for Designer
             )
             tools_json = temp_agent.tools.get_tool_definitions_json()
             

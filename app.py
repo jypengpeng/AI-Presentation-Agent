@@ -303,9 +303,9 @@ def init_session_state():
     if "slide_generation_stats" not in st.session_state:
         st.session_state.slide_generation_stats = None
     
-    # Slide generation concurrency from env
+    # Slide generation concurrency from env (0 = unlimited, default)
     if "slide_concurrency" not in st.session_state:
-        st.session_state.slide_concurrency = int(os.environ.get("SLIDE_GENERATION_CONCURRENCY", "3"))
+        st.session_state.slide_concurrency = int(os.environ.get("SLIDE_GENERATION_CONCURRENCY", "0"))
     
     # Slide generation timeout from env
     if "slide_timeout" not in st.session_state:
@@ -429,6 +429,87 @@ def count_slides(html_content: str) -> int:
     # Try to count divs with slide class
     slide_count = len(re.findall(r'<div[^>]*class="[^"]*slide[^"]*"[^>]*>', html_content, re.IGNORECASE))
     return max(slide_count, 1)
+
+
+def prepare_html_for_preview(html_content: str, container_height: int = 600) -> str:
+    """
+    Prepare HTML content for iframe preview by fixing viewport and positioning issues.
+    
+    In Streamlit's components.html(), content is rendered in an iframe with fixed height.
+    This causes issues with:
+    - 100vh units (refers to iframe height, not browser viewport)
+    - position: fixed (positions relative to iframe, not browser)
+    - overflow: hidden on body (may clip content)
+    
+    This function injects CSS fixes to make the content display correctly in the iframe.
+    
+    Args:
+        html_content: The original HTML content
+        container_height: The height of the iframe container in pixels
+        
+    Returns:
+        Modified HTML content suitable for iframe preview
+    """
+    if not html_content:
+        return html_content
+    
+    # CSS fixes for iframe compatibility
+    iframe_fix_css = f"""
+<style id="iframe-preview-fixes">
+    /* Fix viewport units - use container height instead of vh */
+    html, body {{
+        height: {container_height}px !important;
+        min-height: {container_height}px !important;
+        max-height: {container_height}px !important;
+        overflow: auto !important;
+    }}
+    
+    /* Convert fixed positioning to absolute within container */
+    .fixed {{
+        position: absolute !important;
+    }}
+    
+    /* Ensure slide container fills the iframe */
+    .slide-container {{
+        height: {container_height}px !important;
+        min-height: {container_height}px !important;
+        overflow: auto !important;
+    }}
+    
+    /* Fix navigation indicator positioning */
+    [class*="fixed"][class*="bottom"] {{
+        position: absolute !important;
+        bottom: 16px !important;
+    }}
+    
+    /* Ensure flex containers don't overflow */
+    .h-full {{
+        height: 100% !important;
+        max-height: {container_height - 32}px !important;
+    }}
+    
+    /* Allow scrolling for content that exceeds container */
+    .flex-1 {{
+        overflow: auto !important;
+        min-height: 0 !important;
+    }}
+</style>
+"""
+    
+    # Inject the CSS fix right before </head> or at the start of <body>
+    if '</head>' in html_content:
+        html_content = html_content.replace('</head>', f'{iframe_fix_css}</head>')
+    elif '<body' in html_content:
+        # Find the end of the body tag
+        body_match = re.search(r'<body[^>]*>', html_content)
+        if body_match:
+            insert_pos = body_match.end()
+            html_content = html_content[:insert_pos] + iframe_fix_css + html_content[insert_pos:]
+    else:
+        # Fallback: prepend to content
+        html_content = iframe_fix_css + html_content
+    
+    return html_content
 
 
 def format_tool_args(args: dict) -> str:
@@ -1314,8 +1395,9 @@ def render_slide_card(task: Task, slide_meta: dict, index: int):
             if slide_path.exists():
                 try:
                     slide_content = slide_path.read_text(encoding='utf-8')
-                    # Show a small preview
-                    components.html(slide_content, height=120, scrolling=False)
+                    # Show a small preview with iframe fixes
+                    preview_content = prepare_html_for_preview(slide_content, container_height=120)
+                    components.html(preview_content, height=120, scrolling=False)
                 except:
                     st.info("预览加载失败")
             else:
@@ -1387,7 +1469,9 @@ def render_expanded_slide_view(task: Task, manifest: dict):
         if slide_path.exists():
             try:
                 slide_content = slide_path.read_text(encoding='utf-8')
-                components.html(slide_content, height=500, scrolling=True)
+                # Apply iframe fixes for correct preview rendering
+                preview_content = prepare_html_for_preview(slide_content, container_height=500)
+                components.html(preview_content, height=500, scrolling=True)
             except Exception as e:
                 st.error(f"预览加载失败: {e}")
         else:
@@ -1456,7 +1540,8 @@ def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedba
             workspace_dir=task.workspace_dir,
             model=st.session_state.model,
             base_url=st.session_state.base_url if st.session_state.base_url else None,
-            system_prompt_override=system_prompt
+            system_prompt_override=system_prompt,
+            include_image_tool=True  # Enable image generation for Designer agents
         )
     
     try:
@@ -1629,17 +1714,19 @@ def render_plan_editor():
     try:
         preview_plan = json.loads(edited_plan)
         slide_count = len(preview_plan.get("slides", []))
-        theme = preview_plan.get("theme", {})
-        st.caption(f"📊 共 {slide_count} 页幻灯片 | 主题: {theme.get('color_palette', '默认')}")
+        st.caption(f"📊 共 {slide_count} 页幻灯片")
         
         # Show slide titles
         with st.expander("查看幻灯片列表", expanded=False):
             for i, slide in enumerate(preview_plan.get("slides", [])):
-                slide_type = slide.get("type", "unknown")
                 slide_title = slide.get("title", f"幻灯片 {i+1}")
-                st.markdown(f"{i+1}. **[{slide_type}]** {slide_title}")
-    except:
-        st.caption("⚠️ JSON 格式无效，请检查语法")
+                st.markdown(f"{i+1}. {slide_title}")
+    except json.JSONDecodeError as e:
+        st.caption(f"⚠️ JSON 格式无效: {e.msg} (行 {e.lineno}, 列 {e.colno})")
+        # Show a helper to validate online
+        st.caption("💡 提示: 可以复制 JSON 到 [jsonlint.com](https://jsonlint.com) 检查语法错误")
+    except Exception as e:
+        st.caption(f"⚠️ JSON 格式无效: {str(e)}")
     
     st.divider()
     
@@ -1751,8 +1838,10 @@ def render_preview_panel():
                 """
                 html_content = html_content.replace('</body>', f'{nav_script}</body>')
             
+            # Apply iframe fixes for correct preview rendering
+            preview_content = prepare_html_for_preview(html_content, container_height=600)
             components.html(
-                html_content,
+                preview_content,
                 height=600,
                 scrolling=True
             )
@@ -1820,7 +1909,9 @@ def render_multi_slide_preview(task: Task, slide_files: List[Path]):
         slide_content = get_slide_content(task, selected_idx)
         if slide_content:
             try:
-                components.html(slide_content, height=600, scrolling=True)
+                # Apply iframe fixes for correct preview rendering
+                preview_content = prepare_html_for_preview(slide_content, container_height=600)
+                components.html(preview_content, height=600, scrolling=True)
             except Exception as e:
                 st.error(f"渲染幻灯片时出错: {e}")
         else:
@@ -1869,16 +1960,66 @@ def validate_presentation_plan(plan_json: str) -> Tuple[bool, Optional[dict], Op
     """
     Validate a presentation plan JSON string.
     
+    Simplified schema - only requires: id, title, content for each slide.
+    
     Args:
         plan_json: JSON string to validate
         
     Returns:
         Tuple of (is_valid, parsed_plan, error_message)
     """
+    # Clean the input - remove potential invisible characters that can cause issues
+    # This handles issues from copy-paste or text_area processing
+    cleaned_json = plan_json.strip()
+    
+    # Remove BOM if present
+    if cleaned_json.startswith('\ufeff'):
+        cleaned_json = cleaned_json[1:]
+    
+    # Replace problematic whitespace characters
+    import re
+    # Replace non-breaking spaces and other unicode spaces with regular space
+    cleaned_json = re.sub(r'[\u00a0\u2000-\u200b\u2028\u2029\u202f\u205f\u3000]', ' ', cleaned_json)
+    
     try:
-        plan = json.loads(plan_json)
+        plan = json.loads(cleaned_json)
     except json.JSONDecodeError as e:
-        return False, None, f"JSON 解析错误: {str(e)}"
+        # Provide more detailed error information
+        error_line = e.lineno
+        error_col = e.colno
+        error_pos = e.pos
+        
+        # Try to show context around the error
+        lines = cleaned_json.split('\n')
+        context_lines = []
+        
+        if error_line and error_line > 0:
+            start_line = max(0, error_line - 3)
+            end_line = min(len(lines), error_line + 2)
+            
+            for i in range(start_line, end_line):
+                line_num = i + 1
+                marker = ">>> " if line_num == error_line else "    "
+                line_content = lines[i] if i < len(lines) else ""
+                # Truncate very long lines
+                if len(line_content) > 100:
+                    if error_col and line_num == error_line and error_col > 50:
+                        # Show around the error position
+                        start = max(0, error_col - 50)
+                        end = min(len(line_content), error_col + 50)
+                        line_content = f"...{line_content[start:end]}..."
+                    else:
+                        line_content = line_content[:100] + "..."
+                context_lines.append(f"{marker}L{line_num}: {line_content}")
+        
+        context_str = "\n".join(context_lines) if context_lines else ""
+        
+        error_msg = f"JSON 解析错误: {e.msg}\n"
+        error_msg += f"位置: 第 {error_line} 行, 第 {error_col} 列 (字符位置 {error_pos})\n"
+        if context_str:
+            error_msg += f"\n错误位置附近内容:\n{context_str}"
+        
+        return False, None, error_msg
     
     # Check required fields
     if not isinstance(plan, dict):
@@ -1893,7 +2034,7 @@ def validate_presentation_plan(plan_json: str) -> Tuple[bool, Optional[dict], Op
     if len(plan.get("slides", [])) == 0:
         return False, None, "'slides' 数组不能为空"
     
-    # Validate each slide
+    # Validate each slide - simplified schema: only id, title, content required
     for i, slide in enumerate(plan.get("slides", [])):
         if not isinstance(slide, dict):
             return False, None, f"第 {i+1} 个幻灯片必须是一个对象"
@@ -1901,21 +2042,11 @@ def validate_presentation_plan(plan_json: str) -> Tuple[bool, Optional[dict], Op
         if "id" not in slide:
             return False, None, f"第 {i+1} 个幻灯片缺少 'id' 字段"
         
-        if "type" not in slide:
-            return False, None, f"第 {i+1} 个幻灯片缺少 'type' 字段"
-        
         if "title" not in slide:
             return False, None, f"第 {i+1} 个幻灯片缺少 'title' 字段"
-    
-    # Check theme (optional but recommended)
-    if "theme" not in plan:
-        # Add default theme
-        plan["theme"] = {
-            "color_palette": "Modern Blue",
-            "background_class": "bg-slate-900",
-            "text_primary": "text-white",
-            "text_accent": "text-blue-400"
-        }
+        
+        if "content" not in slide:
+            return False, None, f"第 {i+1} 个幻灯片缺少 'content' 字段"
     
     return True, plan, None
 
@@ -1979,7 +2110,7 @@ def confirm_and_start_generation(task: Task, plan_json: str):
     # Validate the JSON
     is_valid, plan, error = validate_presentation_plan(plan_json)
     
-    if not is_valid:
+    if not is_valid or plan is None:
         st.session_state.plan_editor_error = error
         return
     
@@ -2100,7 +2231,8 @@ def trigger_slide_generation_background(
             workspace_dir=workspace_dir,
             model=model,
             base_url=base_url if base_url else None,
-            system_prompt_override=system_prompt
+            system_prompt_override=system_prompt,
+            include_image_tool=True  # Enable image generation for Designer agents
         )
     
     # Run concurrent generation
@@ -2126,14 +2258,18 @@ def trigger_slide_generation_background(
         traceback.print_exc()
 
 
-def run_architect_phase(task: Task, collector_summary: str, live_container=None):
+def run_architect_phase(task: Task, collector_summary: str, live_container=None, max_json_retries: int = 3):
     """
     Run the Architect phase to create presentation_plan.json.
+    
+    Includes automatic JSON validation and retry loop - if the generated JSON
+    is invalid, the agent will be asked to fix it.
     
     Args:
         task: The current task
         collector_summary: Summary from the information collection phase
         live_container: Container for live updates
+        max_json_retries: Maximum number of JSON validation retries
     """
     # Get the existing agent (with conversation history)
     agent = get_or_create_agent(task)
@@ -2177,10 +2313,102 @@ def run_architect_phase(task: Task, collector_summary: str, live_container=None)
 确保创建 slides 目录（如果不存在）。
 """
     
+    json_retry_count = 0
+    plan_path = Path(task.workspace_dir) / "slides" / "presentation_plan.json"
+    
+    # Streaming display state
+    current_streaming_text = ""
+    live_events = []
+    last_render_time = 0
+    RENDER_THROTTLE_MS = 300
+    
+    def render_architect_output(force: bool = False):
+        """Render the architect's streaming output."""
+        nonlocal last_render_time
+        
+        if live_container is None:
+            return
+        
+        current_time = time.time() * 1000
+        if not force and (current_time - last_render_time) < RENDER_THROTTLE_MS:
+            return
+        
+        last_render_time = current_time
+        
+        try:
+            with live_container.container():
+                # Show phase indicator
+                st.info("📐 Architect Agent 正在规划演示文稿结构...")
+                
+                # Show completed events
+                for evt in live_events:
+                    render_chat_message(evt)
+                
+                # Show streaming text
+                if current_streaming_text:
+                    display_text = current_streaming_text
+                    if len(display_text) > 2000:
+                        display_text = display_text[-2000:] + "\n... (显示最后 2000 字符)"
+                    
+                    st.markdown(f"""
+                    <div class="chat-message assistant-message">
+                        <strong>🤖 Architect:</strong> <span style="color: #888;">(正在规划...)</span><br>
+                        <pre style="white-space: pre-wrap; word-wrap: break-word;">{display_text}</pre>
+                    </div>
+                    """, unsafe_allow_html=True)
+        except Exception:
+            pass
+    
+    def validate_and_get_error() -> Optional[str]:
+        """Validate the JSON file and return error message if invalid."""
+        if not plan_path.exists():
+            return None  # File doesn't exist yet, no validation needed
+        
+        try:
+            content = plan_path.read_text(encoding='utf-8')
+            is_valid, _, error = validate_presentation_plan(content)
+            if not is_valid:
+                return error
+            return None  # Valid
+        except Exception as e:
+            return f"读取文件出错: {str(e)}"
+    
+    # Show initial message and render immediately
+    if live_container:
+        with live_container.container():
+            st.info("📐 Architect Agent 正在规划演示文稿结构...")
+            st.caption("⏳ 正在等待 AI 响应，这可能需要几秒钟...")
+    
+    # Add a small delay to allow Streamlit to render the initial message
+    time.sleep(0.1)
+    
+    # Track if we've received any streaming content
+    first_response_received = False
+    
     # Run the agent
     try:
         for event in agent.run(architect_task, stream=True):
+            # Update first response flag
+            if not first_response_received:
+                first_response_received = True
+                # Clear the "waiting" message since we're now receiving content
             event_type = event.get("type")
+            
+            # Handle streaming events
+            if event_type == "streaming_delta":
+                current_streaming_text = event.get("accumulated", "")
+                # Force render on first delta to clear "waiting" message
+                render_architect_output(force=not first_response_received or len(current_streaming_text) < 100)
+                continue
+            
+            elif event_type == "streaming_complete":
+                content = event.get("content", "")
+                if content:
+                    task_manager.add_chat_message(task.id, {"type": "assistant_message", "content": content})
+                    live_events.append({"type": "assistant_message", "content": content})
+                current_streaming_text = ""
+                render_architect_output(force=True)
+                continue
             
             # Convert ToolCallInfo to dict for serialization
             if event_type in ["tool_call", "tool_result"]:
@@ -2200,29 +2428,19 @@ def run_architect_phase(task: Task, collector_summary: str, live_container=None)
                         }
                     }
             
-            # Save to history
-            if event_type not in ["streaming_delta"]:
-                if event_type == "streaming_complete":
-                    content = event.get("content", "")
-                    if content:
-                        task_manager.add_chat_message(task.id, {"type": "assistant_message", "content": content})
-                else:
-                    task_manager.add_chat_message(task.id, event)
+            # Save to history and display
+            task_manager.add_chat_message(task.id, event)
+            live_events.append(event)
+            render_architect_output(force=True)
             
-            # Check for phase_complete
+            # Check for phase_complete or write_file
             if event_type == "tool_result":
                 tc = event.get("tool_call")
                 if tc:
                     tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
-                    if tc_name == "phase_complete":
-                        tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
-                        if tc_result:
-                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else (tc_result.data if hasattr(tc_result, 'data') else None)
-                            if result_data and result_data.get("phase") == "architect":
-                                # Trigger slide generation
-                                handle_phase_complete(task, "architect", result_data.get("summary", ""), live_container)
-                                break
-                    elif tc_name == "write_file":
+                    tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                    
+                    if tc_name == "write_file":
                         # Check if presentation_plan.json was written
                         tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
                         if tc_args:
@@ -2231,6 +2449,169 @@ def run_architect_phase(task: Task, collector_summary: str, live_container=None)
                                 file_path = file_entry.get("path", "") if isinstance(file_entry, dict) else ""
                                 if "presentation_plan.json" in file_path:
                                     st.session_state.preview_key += 1
+                                    
+                                    # Validate the JSON immediately after write
+                                    validation_error = validate_and_get_error()
+                                    
+                                    if validation_error:
+                                        json_retry_count += 1
+                                        
+                                        if live_container:
+                                            with live_container.container():
+                                                st.warning(f"⚠️ JSON 验证失败 (尝试 {json_retry_count}/{max_json_retries}): {validation_error[:200]}...")
+                                        
+                                        if json_retry_count >= max_json_retries:
+                                            if live_container:
+                                                with live_container.container():
+                                                    st.error(f"❌ JSON 验证失败次数过多，请手动修复")
+                                            # Still proceed to show editor with error
+                                            handle_phase_complete(task, "architect", "", live_container)
+                                            return
+                                        
+                                        # Send error back to agent for correction
+                                        correction_task = f"""你写入的 presentation_plan.json 文件有错误，请修复后重新写入。
+
+**错误信息:**
+{validation_error}
+
+**修复要求:**
+1. 确保 JSON 格式正确（注意逗号、引号、括号配对）
+2. 每个 slide 必须包含 id、title、content 三个字段
+3. 如果 content 中有特殊字符，确保正确转义
+4. 使用 write_file 写入修复后的完整 JSON
+
+请立即修复并重新写入文件。
+"""
+                                        # Show retry message
+                                        live_events.append({"type": "assistant_message", "content": f"🔄 正在修复 JSON 错误 (尝试 {json_retry_count}/{max_json_retries})..."})
+                                        render_architect_output(force=True)
+                                        
+                                        # Continue the agent with correction task
+                                        for retry_event in agent.run(correction_task, stream=True):
+                                            retry_type = retry_event.get("type")
+                                            
+                                            # Handle streaming for retry
+                                            if retry_type == "streaming_delta":
+                                                current_streaming_text = retry_event.get("accumulated", "")
+                                                render_architect_output(force=False)
+                                                continue
+                                            
+                                            elif retry_type == "streaming_complete":
+                                                r_content = retry_event.get("content", "")
+                                                if r_content:
+                                                    task_manager.add_chat_message(task.id, {"type": "assistant_message", "content": r_content})
+                                                    live_events.append({"type": "assistant_message", "content": r_content})
+                                                current_streaming_text = ""
+                                                render_architect_output(force=True)
+                                                continue
+                                            
+                                            # Convert ToolCallInfo
+                                            if retry_type in ["tool_call", "tool_result"]:
+                                                rtc = retry_event.get("tool_call")
+                                                if rtc and not isinstance(rtc, dict):
+                                                    retry_event = {
+                                                        "type": retry_type,
+                                                        "tool_call": {
+                                                            "id": rtc.id,
+                                                            "name": rtc.name,
+                                                            "arguments": rtc.arguments,
+                                                            "result": {
+                                                                "success": rtc.result.success if rtc.result else False,
+                                                                "data": rtc.result.data if rtc.result else None,
+                                                                "error": rtc.result.error if rtc.result else None
+                                                            } if rtc.result else None
+                                                        }
+                                                    }
+                                            
+                                            # Save to history and display
+                                            task_manager.add_chat_message(task.id, retry_event)
+                                            live_events.append(retry_event)
+                                            render_architect_output(force=True)
+                                            
+                                            # Check if file was rewritten
+                                            if retry_type == "tool_result":
+                                                rtc = retry_event.get("tool_call")
+                                                if rtc:
+                                                    rtc_name = rtc.get("name") if isinstance(rtc, dict) else rtc.name
+                                                    if rtc_name == "write_file":
+                                                        rtc_args = rtc.get("arguments") if isinstance(rtc, dict) else rtc.arguments
+                                                        if rtc_args:
+                                                            r_files = rtc_args.get("files", [])
+                                                            for r_file in r_files:
+                                                                r_path = r_file.get("path", "") if isinstance(r_file, dict) else ""
+                                                                if "presentation_plan.json" in r_path:
+                                                                    st.session_state.preview_key += 1
+                                                                    
+                                                                    # Re-validate
+                                                                    new_error = validate_and_get_error()
+                                                                    if new_error is None:
+                                                                        # Success! Proceed to editor
+                                                                        if live_container:
+                                                                            with live_container.container():
+                                                                                st.success("✅ JSON 验证通过！")
+                                                                        handle_phase_complete(task, "architect", "", live_container)
+                                                                        return
+                                                                    # Still error, will continue retry loop on next iteration
+                                                    elif rtc_name == "phase_complete":
+                                                        # Agent thinks it's done, but we need to verify
+                                                        final_error = validate_and_get_error()
+                                                        if final_error is None:
+                                                            handle_phase_complete(task, "architect", "", live_container)
+                                                            return
+                                        continue  # Continue outer loop
+                                    else:
+                                        # JSON is valid, can proceed
+                                        if live_container:
+                                            with live_container.container():
+                                                st.success("✅ JSON 验证通过！")
+                    
+                    elif tc_name == "phase_complete":
+                        if tc_result:
+                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else (tc_result.data if hasattr(tc_result, 'data') else None)
+                            if result_data and result_data.get("phase") == "architect":
+                                # Validate before proceeding
+                                validation_error = validate_and_get_error()
+                                if validation_error and json_retry_count < max_json_retries:
+                                    json_retry_count += 1
+                                    # Send correction task
+                                    correction_task = f"""phase_complete 被调用，但 JSON 验证失败。请先修复 JSON 错误。
+
+**错误信息:**
+{validation_error}
+
+请使用 write_file 写入修复后的 presentation_plan.json，然后再调用 phase_complete。
+"""
+                                    # Show retry message
+                                    live_events.append({"type": "assistant_message", "content": f"🔄 JSON 验证失败，正在修复..."})
+                                    render_architect_output(force=True)
+                                    
+                                    for retry_event in agent.run(correction_task, stream=True):
+                                        retry_type = retry_event.get("type")
+                                        
+                                        # Handle streaming
+                                        if retry_type == "streaming_delta":
+                                            current_streaming_text = retry_event.get("accumulated", "")
+                                            render_architect_output(force=False)
+                                            continue
+                                        
+                                        elif retry_type == "streaming_complete":
+                                            r_content = retry_event.get("content", "")
+                                            if r_content:
+                                                task_manager.add_chat_message(task.id, {"type": "assistant_message", "content": r_content})
+                                                live_events.append({"type": "assistant_message", "content": r_content})
+                                            current_streaming_text = ""
+                                            render_architect_output(force=True)
+                                            continue
+                                        
+                                        # Save and display other events
+                                        task_manager.add_chat_message(task.id, retry_event)
+                                        live_events.append(retry_event)
+                                        render_architect_output(force=True)
+                                    continue
+                                
+                                # Trigger slide generation
+                                handle_phase_complete(task, "architect", result_data.get("summary", ""), live_container)
+                                break
     
     except Exception as e:
         if live_container:
@@ -2302,7 +2683,8 @@ def trigger_slide_generation(task: Task, live_container=None):
             workspace_dir=task.workspace_dir,
             model=st.session_state.model,
             base_url=st.session_state.base_url if st.session_state.base_url else None,
-            system_prompt_override=system_prompt
+            system_prompt_override=system_prompt,
+            include_image_tool=True  # Enable image generation for Designer agents
         )
     
     # Run concurrent generation
@@ -2380,7 +2762,8 @@ def regenerate_slide(task: Task, slide_index: int, feedback: str):
             workspace_dir=task.workspace_dir,
             model=st.session_state.model,
             base_url=st.session_state.base_url if st.session_state.base_url else None,
-            system_prompt_override=system_prompt
+            system_prompt_override=system_prompt,
+            include_image_tool=True  # Enable image generation for Designer agents
         )
     
     st.session_state.is_processing = True

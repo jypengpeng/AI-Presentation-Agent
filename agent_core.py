@@ -221,16 +221,19 @@ class AgentTools:
     # Default patterns to ignore when listing files
     DEFAULT_IGNORED = ['.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea', '.vscode']
     
-    def __init__(self, workspace_dir: str, ignore_patterns: Optional[list[str]] = None):
+    def __init__(self, workspace_dir: str, ignore_patterns: Optional[list[str]] = None, include_image_tool: bool = False):
         """
         Initialize the AgentTools.
         
         Args:
             workspace_dir: The root directory for all file operations
             ignore_patterns: List of patterns to ignore when listing files
+            include_image_tool: Whether to include the generate_image tool (default: False).
+                               This tool is only available to Designer agents.
         """
         self.workspace_dir = Path(workspace_dir).resolve()
         self.ignore_patterns = ignore_patterns or self.DEFAULT_IGNORED
+        self.include_image_tool = include_image_tool
         
     def _should_ignore(self, name: str) -> bool:
         """Check if a file/directory should be ignored based on patterns."""
@@ -989,6 +992,56 @@ class AgentTools:
         )
     
     # =========================================================================
+    # generate_image
+    # =========================================================================
+    
+    def generate_image(self, prompt: str, save_path: str, timeout: int = 120) -> ToolResult:
+        """
+        Generate an image using AI API and save to file.
+        
+        Args:
+            prompt: The text prompt describing the image to generate
+            save_path: Path to save the generated image (relative to workspace)
+            timeout: Request timeout in seconds (default: 120)
+            
+        Returns:
+            ToolResult containing file path on success
+        """
+        # Validate prompt
+        if not prompt or not prompt.strip():
+            return ToolResult(success=False, error="Prompt is required and cannot be empty")
+        
+        if not save_path:
+            return ToolResult(success=False, error="save_path is required")
+        
+        # Validate and resolve path (security check)
+        try:
+            resolved_path = self._resolve_path(save_path)
+        except ValueError as e:
+            return ToolResult(success=False, error=str(e))
+        
+        # Import and call the image generation function
+        try:
+            from gen_image import generate_image_tool
+            result = generate_image_tool(prompt, save_path=str(resolved_path), timeout=timeout)
+            
+            if result["success"]:
+                return ToolResult(
+                    success=True,
+                    data={
+                        'file_path': save_path,  # Return relative path
+                        'format': result["format"],
+                        'message': f"Image generated and saved to {save_path}"
+                    }
+                )
+            else:
+                return ToolResult(success=False, error=result["error"])
+        except ImportError:
+            return ToolResult(success=False, error="gen_image module not found. Please ensure gen_image.py is available.")
+        except Exception as e:
+            return ToolResult(success=False, error=f"Image generation failed: {str(e)}")
+    
+    # =========================================================================
     # Tool Definitions for JSON Boundary Marker Format
     # =========================================================================
     
@@ -1131,8 +1184,31 @@ class AgentTools:
                     "tool": "phase_complete",
                     "parameters": {"phase": "collecting", "summary": "Analyzed the project: it's a Python data analysis project with 3 CSV files..."}
                 }
-            }
+            },
         ]
+        
+        # Only include generate_image tool if explicitly enabled (for Designer agents)
+        if self.include_image_tool:
+            tools.append({
+                "name": "generate_image",
+                "description": "Generate an image using AI API based on a text prompt. The image will be saved to the specified path. Useful for creating visual content, illustrations, charts, diagrams, or decorative images for presentations.",
+                "parameters": {
+                    "prompt": {
+                        "type": "string",
+                        "required": True,
+                        "description": "The text prompt describing the image to generate. Be descriptive and specific for best results. Include style, colors, composition details."
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "required": True,
+                        "description": "Path to save the generated image (relative to workspace root). Include file extension (e.g., 'images/chart.png')"
+                    }
+                },
+                "example": {
+                    "tool": "generate_image",
+                    "parameters": {"prompt": "A professional minimalist icon of a rising bar chart with blue gradient colors, white background, clean vector style", "save_path": "images/growth_icon.png"}
+                }
+            })
         
         # Build tool descriptions
         tool_descriptions = []
@@ -1195,6 +1271,10 @@ You can call multiple tools by outputting multiple tool blocks:
         Returns:
             ToolResult from the tool execution
         """
+        # Check if generate_image is being called but not enabled
+        if tool_name == 'generate_image' and not self.include_image_tool:
+            return ToolResult(success=False, error="generate_image tool is not available. This tool is only available to Designer agents.")
+        
         tool_handlers = {
             'list_files': lambda args: self.list_files(
                 paths=args.get('paths', ['.']),
@@ -1221,6 +1301,11 @@ You can call multiple tools by outputting multiple tool blocks:
             'phase_complete': lambda args: self.phase_complete(
                 phase=args.get('phase', ''),
                 summary=args.get('summary', '')
+            ),
+            'generate_image': lambda args: self.generate_image(
+                prompt=args.get('prompt', ''),
+                save_path=args.get('save_path', ''),
+                timeout=args.get('timeout', 120)
             )
         }
         
@@ -1277,7 +1362,8 @@ class Agent:
         on_tool_call: Optional[Callable[[ToolCallInfo], None]] = None,
         on_message: Optional[Callable[[str, str], None]] = None,
         enable_thinking: Optional[bool] = None,
-        system_prompt_override: Optional[str] = None
+        system_prompt_override: Optional[str] = None,
+        include_image_tool: bool = False
     ):
         """
         Initialize the Agent.
@@ -1296,6 +1382,8 @@ class Agent:
                            False = force disable
             system_prompt_override: If provided, use this string as the system prompt
                                    instead of loading from system_prompt_path
+            include_image_tool: Whether to include the generate_image tool (default: False).
+                               This should only be True for Designer agents.
         """
         self.model = model
         self.workspace_dir = Path(workspace_dir).resolve()
@@ -1323,7 +1411,7 @@ class Agent:
         self.client = OpenAI(**client_kwargs)
         
         # Initialize tools
-        self.tools = AgentTools(workspace_dir)
+        self.tools = AgentTools(workspace_dir, include_image_tool=include_image_tool)
         
         # Load system prompt and append tool definitions
         if system_prompt_override:
