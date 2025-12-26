@@ -13,6 +13,8 @@ import json
 import re
 import shutil
 import time
+import asyncio
+import threading
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -22,6 +24,7 @@ from task_manager import TaskManager, Task
 from typing import Optional, List, Tuple
 from directory_picker import pick_directory, is_valid_directory
 from workspace_copier import WorkspaceCopier, ScanResult
+from slide_generator import SlideGenerator, get_slide_status_summary, parse_presentation_plan
 
 # Load environment variables from .env file
 load_dotenv()
@@ -138,6 +141,90 @@ st.markdown("""
         background-color: rgba(33, 150, 243, 0.2);
         border-left: 3px solid #2196f3;
     }
+    
+    /* Grid view card styling */
+    .slide-card {
+        border: 1px solid #ddd;
+        border-radius: 0.5rem;
+        padding: 0.5rem;
+        margin-bottom: 0.5rem;
+        background-color: #fafafa;
+        transition: all 0.2s ease;
+    }
+    
+    .slide-card:hover {
+        border-color: #2196f3;
+        box-shadow: 0 2px 8px rgba(33, 150, 243, 0.2);
+    }
+    
+    .slide-card.status-pending {
+        border-left: 4px solid #9e9e9e;
+    }
+    
+    .slide-card.status-generating {
+        border-left: 4px solid #2196f3;
+        animation: pulse 1.5s infinite;
+    }
+    
+    .slide-card.status-completed {
+        border-left: 4px solid #4caf50;
+    }
+    
+    .slide-card.status-failed {
+        border-left: 4px solid #f44336;
+    }
+    
+    .slide-card.status-modified {
+        border-left: 4px solid #ff9800;
+    }
+    
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.7; }
+        100% { opacity: 1; }
+    }
+    
+    .slide-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }
+    
+    .slide-card-title {
+        font-weight: bold;
+        font-size: 0.9rem;
+        color: #333;
+    }
+    
+    .slide-card-type {
+        font-size: 0.75rem;
+        color: #666;
+        background-color: #e0e0e0;
+        padding: 0.1rem 0.4rem;
+        border-radius: 0.25rem;
+    }
+    
+    .slide-card-preview {
+        height: 120px;
+        background-color: #f5f5f5;
+        border-radius: 0.25rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+    }
+    
+    .slide-card-preview iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+        pointer-events: none;
+    }
+    
+    .status-icon {
+        font-size: 1.2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -198,6 +285,49 @@ def init_session_state():
     # Sync confirmation state
     if "confirm_sync" not in st.session_state:
         st.session_state.confirm_sync = False
+    
+    # Presentation plan editing state
+    if "pending_presentation_plan" not in st.session_state:
+        st.session_state.pending_presentation_plan = None
+    
+    if "show_plan_editor" not in st.session_state:
+        st.session_state.show_plan_editor = False
+    
+    if "plan_editor_error" not in st.session_state:
+        st.session_state.plan_editor_error = None
+    
+    # Slide generation state
+    if "slide_generation_in_progress" not in st.session_state:
+        st.session_state.slide_generation_in_progress = False
+    
+    if "slide_generation_stats" not in st.session_state:
+        st.session_state.slide_generation_stats = None
+    
+    # Slide generation concurrency from env
+    if "slide_concurrency" not in st.session_state:
+        st.session_state.slide_concurrency = int(os.environ.get("SLIDE_GENERATION_CONCURRENCY", "3"))
+    
+    # Slide generation timeout from env
+    if "slide_timeout" not in st.session_state:
+        st.session_state.slide_timeout = float(os.environ.get("SLIDE_GENERATION_TIMEOUT", "120"))
+    
+    # Current workflow phase
+    if "current_phase" not in st.session_state:
+        st.session_state.current_phase = "collecting"  # collecting -> architect -> editing_plan -> designing -> completed
+    
+    # Grid view state
+    if "grid_expanded_slide" not in st.session_state:
+        st.session_state.grid_expanded_slide = None  # ID of currently expanded slide
+    
+    if "last_refresh_time" not in st.session_state:
+        st.session_state.last_refresh_time = 0
+    
+    if "auto_refresh_enabled" not in st.session_state:
+        st.session_state.auto_refresh_enabled = True
+    
+    # Slide modification state
+    if "slide_modification_in_progress" not in st.session_state:
+        st.session_state.slide_modification_in_progress = False
 
 
 init_session_state()
@@ -227,6 +357,63 @@ def get_html_content() -> Optional[str]:
             return f"<html><body><p style='color:red'>Error reading file: {e}</p></body></html>"
     
     return None
+
+
+def get_slides_dir(task: Task) -> Optional[Path]:
+    """Get the slides directory for a task."""
+    slides_dir = Path(task.workspace_dir) / "slides"
+    if slides_dir.exists() and slides_dir.is_dir():
+        return slides_dir
+    return None
+
+
+def get_slide_files(task: Task) -> List[Path]:
+    """Get list of slide HTML files in order."""
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        return []
+    
+    manifest_path = slides_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            files = []
+            for slide in manifest.get("slides", []):
+                slide_file = slides_dir / slide.get("file", "")
+                if slide_file.exists():
+                    files.append(slide_file)
+            return files
+        except:
+            pass
+    
+    # Fallback: glob for slide_*.html
+    return sorted(slides_dir.glob("slide_*.html"))
+
+
+def get_slide_content(task: Task, slide_index: int) -> Optional[str]:
+    """Get content of a specific slide file."""
+    files = get_slide_files(task)
+    if 0 <= slide_index < len(files):
+        try:
+            return files[slide_index].read_text(encoding='utf-8')
+        except:
+            pass
+    return None
+
+
+def create_slide_generator(task: Task) -> Optional[SlideGenerator]:
+    """Create a SlideGenerator instance for the task."""
+    if not st.session_state.api_key:
+        return None
+    
+    return SlideGenerator(
+        api_key=st.session_state.api_key,
+        workspace_dir=task.workspace_dir,
+        model=st.session_state.model,
+        base_url=st.session_state.base_url if st.session_state.base_url else None,
+        concurrency=st.session_state.slide_concurrency,
+        task_timeout=st.session_state.slide_timeout
+    )
 
 
 def count_slides(html_content: str) -> int:
@@ -780,6 +967,17 @@ def render_task_settings():
     else:
         st.caption("⚠️ HTML 文件不存在")
     
+    # Show slides directory status
+    slides_dir = get_slides_dir(task)
+    if slides_dir:
+        status = get_slide_status_summary(slides_dir)
+        if "error" not in status:
+            st.caption(
+                f"📁 Slides: {status.get('completed', 0)}/{status.get('total', 0)} 完成"
+            )
+            if status.get('failed', 0) > 0:
+                st.caption(f"⚠️ {status.get('failed', 0)} 页生成失败")
+    
     st.caption(f"💬 对话消息: {len(task.chat_history)} 条")
 
 
@@ -982,6 +1180,29 @@ def process_user_message(task: Task, message: str, live_container=None):
                     tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
                     if tc_name == "write_file":
                         st.session_state.preview_key += 1
+                        
+                        # Check if presentation_plan.json was written - trigger slide generation
+                        tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                        if tc_args:
+                            files_written = tc_args.get("files", [])
+                            for file_entry in files_written:
+                                file_path = file_entry.get("path", "") if isinstance(file_entry, dict) else ""
+                                if "presentation_plan.json" in file_path:
+                                    # Phase complete - trigger slide generation
+                                    handle_phase_complete(task, "architect", "", live_container)
+                    
+                    # Handle phase_complete tool
+                    elif tc_name == "phase_complete":
+                        tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                        if tc_result:
+                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else tc_result.data
+                            if result_data and result_data.get("phase_complete"):
+                                phase = result_data.get("phase", "")
+                                summary = result_data.get("summary", "")
+                                handle_phase_complete(task, phase, summary, live_container)
+                                # Stop current agent loop since we're transitioning
+                                st.session_state.is_processing = False
+                                break
             
             # Check if we should stop
             if not st.session_state.is_processing:
@@ -1031,6 +1252,424 @@ def process_user_message(task: Task, message: str, live_container=None):
 # Main Content - Preview Panel
 # ============================================================================
 
+# ============================================================================
+# Grid View Functions
+# ============================================================================
+
+def get_manifest_data(task: Task) -> Optional[dict]:
+    """Get manifest data for the task's slides."""
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        return None
+    
+    manifest_path = slides_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    
+    try:
+        return json.loads(manifest_path.read_text(encoding='utf-8'))
+    except:
+        return None
+
+
+def get_slide_status_icon(status: str) -> str:
+    """Get the icon for a slide status."""
+    icons = {
+        "pending": "⏳",
+        "generating": "🔄",
+        "completed": "✅",
+        "failed": "❌",
+        "modified": "✏️"
+    }
+    return icons.get(status, "❓")
+
+
+def render_slide_card(task: Task, slide_meta: dict, index: int):
+    """Render a single slide card in the grid."""
+    slide_id = slide_meta.get("id", f"slide_{index + 1}")
+    slide_title = slide_meta.get("title", f"Slide {index + 1}")
+    slide_type = slide_meta.get("type", "unknown")
+    slide_status = slide_meta.get("status", "pending")
+    slide_file = slide_meta.get("file", "")
+    
+    is_expanded = st.session_state.grid_expanded_slide == slide_id
+    
+    # Card container
+    with st.container():
+        # Card header with status and title
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            st.markdown(f"**{index + 1}. {slide_title}**")
+            st.caption(f"`{slide_type}`")
+        
+        with col2:
+            status_icon = get_slide_status_icon(slide_status)
+            st.markdown(f"<div class='status-icon'>{status_icon}</div>", unsafe_allow_html=True)
+        
+        # Preview thumbnail or placeholder
+        slides_dir = get_slides_dir(task)
+        if slides_dir and slide_status == "completed":
+            slide_path = slides_dir / slide_file
+            if slide_path.exists():
+                try:
+                    slide_content = slide_path.read_text(encoding='utf-8')
+                    # Show a small preview
+                    components.html(slide_content, height=120, scrolling=False)
+                except:
+                    st.info("预览加载失败")
+            else:
+                st.info("文件不存在")
+        elif slide_status == "generating":
+            st.info("🔄 正在生成...")
+        elif slide_status == "failed":
+            st.error("❌ 生成失败")
+        else:
+            st.info("⏳ 等待生成")
+        
+        # Expand/collapse button
+        if slide_status == "completed":
+            if st.button("🔍 查看/编辑", key=f"expand_{slide_id}", use_container_width=True):
+                if is_expanded:
+                    st.session_state.grid_expanded_slide = None
+                else:
+                    st.session_state.grid_expanded_slide = slide_id
+                st.rerun()
+
+
+def render_expanded_slide_view(task: Task, manifest: dict):
+    """Render the expanded view for editing a slide."""
+    slide_id = st.session_state.grid_expanded_slide
+    if not slide_id:
+        return
+    
+    # Find the slide in manifest
+    slides = manifest.get("slides", [])
+    slide_meta = None
+    slide_index = -1
+    for i, s in enumerate(slides):
+        if s.get("id") == slide_id:
+            slide_meta = s
+            slide_index = i
+            break
+    
+    if not slide_meta:
+        st.error("未找到幻灯片")
+        st.session_state.grid_expanded_slide = None
+        return
+    
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        st.error("未找到幻灯片目录")
+        return
+    
+    # Header with back button
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col1:
+        if st.button("← 返回网格", use_container_width=True):
+            st.session_state.grid_expanded_slide = None
+            st.rerun()
+    with col2:
+        st.subheader(f"📄 {slide_meta.get('title', 'Slide')}")
+    with col3:
+        st.caption(f"第 {slide_index + 1} / {len(slides)} 页")
+    
+    st.divider()
+    
+    # Left-right layout: preview on left, edit on right
+    col_preview, col_edit = st.columns([7, 3])
+    
+    with col_preview:
+        st.markdown("**预览**")
+        slide_file = slide_meta.get("file", "")
+        slide_path = slides_dir / slide_file
+        
+        if slide_path.exists():
+            try:
+                slide_content = slide_path.read_text(encoding='utf-8')
+                components.html(slide_content, height=500, scrolling=True)
+            except Exception as e:
+                st.error(f"预览加载失败: {e}")
+        else:
+            st.warning("幻灯片文件不存在")
+    
+    with col_edit:
+        st.markdown("**✏️ 修改此幻灯片**")
+        
+        modification_input = st.text_area(
+            "请描述您想要的修改",
+            placeholder="例如：将标题改为红色，添加一个柱状图...",
+            height=150,
+            key=f"modify_{slide_id}"
+        )
+        
+        if st.button(
+            "🔄 应用修改",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.slide_modification_in_progress
+        ):
+            if modification_input.strip():
+                apply_slide_modification(task, slide_index, slide_id, modification_input.strip())
+        
+        if st.session_state.slide_modification_in_progress:
+            st.info("⏳ 正在应用修改...")
+    
+    st.divider()
+    
+    # Navigation buttons
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if slide_index > 0:
+            prev_slide = slides[slide_index - 1]
+            if st.button("← 上一页", use_container_width=True):
+                st.session_state.grid_expanded_slide = prev_slide.get("id")
+                st.rerun()
+    with col3:
+        if slide_index < len(slides) - 1:
+            next_slide = slides[slide_index + 1]
+            if st.button("下一页 →", use_container_width=True):
+                st.session_state.grid_expanded_slide = next_slide.get("id")
+                st.rerun()
+
+
+def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedback: str):
+    """Apply modification to a slide using the Designer agent."""
+    st.session_state.slide_modification_in_progress = True
+    
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        st.error("未找到幻灯片目录")
+        st.session_state.slide_modification_in_progress = False
+        return
+    
+    # Create generator and regenerate
+    generator = create_slide_generator(task)
+    if not generator:
+        st.error("无法创建生成器")
+        st.session_state.slide_modification_in_progress = False
+        return
+    
+    def create_designer_agent(system_prompt: str) -> Agent:
+        return Agent(
+            api_key=st.session_state.api_key,
+            workspace_dir=task.workspace_dir,
+            model=st.session_state.model,
+            base_url=st.session_state.base_url if st.session_state.base_url else None,
+            system_prompt_override=system_prompt
+        )
+    
+    try:
+        for event in generator.regenerate_slide(
+            slides_dir=slides_dir,
+            slide_id=slide_id,
+            user_feedback=feedback,
+            create_agent_func=create_designer_agent
+        ):
+            event_type = event.get("type")
+            
+            if event_type == "error":
+                st.error(event.get("error", "未知错误"))
+            elif event_type == "task_completed":
+                st.success("✅ 幻灯片已更新")
+                st.session_state.preview_key += 1
+    
+    except Exception as e:
+        st.error(f"修改失败: {e}")
+    
+    finally:
+        st.session_state.slide_modification_in_progress = False
+        st.rerun()
+
+
+def render_grid_view():
+    """Render the full-screen grid view for slide monitoring and editing."""
+    task = get_current_task()
+    if not task:
+        st.info("👈 请先在侧边栏创建或选择一个任务")
+        return
+    
+    # Check if a slide is expanded
+    if st.session_state.grid_expanded_slide:
+        manifest = get_manifest_data(task)
+        if manifest:
+            render_expanded_slide_view(task, manifest)
+        else:
+            st.error("无法读取幻灯片数据")
+            st.session_state.grid_expanded_slide = None
+        return
+    
+    # Header
+    st.subheader("📊 幻灯片生成监控")
+    
+    # Get manifest data
+    manifest = get_manifest_data(task)
+    
+    if not manifest:
+        st.warning("未找到幻灯片数据。请先完成演示文稿规划。")
+        
+        # Option to go back to chat
+        if st.button("← 返回对话", use_container_width=False):
+            st.session_state.current_phase = "collecting"
+            st.rerun()
+        return
+    
+    slides = manifest.get("slides", [])
+    total = len(slides)
+    completed = sum(1 for s in slides if s.get("status") == "completed")
+    failed = sum(1 for s in slides if s.get("status") == "failed")
+    generating = sum(1 for s in slides if s.get("status") == "generating")
+    pending = sum(1 for s in slides if s.get("status") == "pending")
+    
+    # Progress bar and stats
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        progress = completed / max(total, 1)
+        st.progress(progress, text=f"已完成 {completed}/{total} 页")
+    with col2:
+        if failed > 0:
+            st.error(f"❌ {failed} 失败")
+        elif generating > 0:
+            st.info(f"🔄 {generating} 生成中")
+        elif pending > 0:
+            st.warning(f"⏳ {pending} 等待中")
+        else:
+            st.success("✅ 全部完成")
+    
+    st.divider()
+    
+    # Grid of slide cards
+    # Calculate number of columns (responsive-ish)
+    num_cols = 4 if total > 6 else 3 if total > 3 else min(total, 3)
+    num_cols = max(1, num_cols)
+    
+    # Create rows of cards
+    for row_start in range(0, total, num_cols):
+        cols = st.columns(num_cols)
+        for col_idx, slide_idx in enumerate(range(row_start, min(row_start + num_cols, total))):
+            with cols[col_idx]:
+                render_slide_card(task, slides[slide_idx], slide_idx)
+    
+    st.divider()
+    
+    # Action buttons
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col1:
+        if st.button("📦 导出为单文件", use_container_width=True, disabled=(completed < total)):
+            export_slides(task)
+    
+    with col2:
+        if st.button("🔄 刷新状态", use_container_width=True):
+            st.session_state.preview_key += 1
+            st.rerun()
+    
+    with col3:
+        if st.button("🔙 重新开始", use_container_width=True):
+            st.session_state.current_phase = "collecting"
+            st.session_state.grid_expanded_slide = None
+            st.rerun()
+    
+    # Auto-refresh logic
+    has_pending_or_generating = pending > 0 or generating > 0
+    
+    if has_pending_or_generating and st.session_state.auto_refresh_enabled:
+        # Check if enough time has passed since last refresh
+        current_time = time.time()
+        if current_time - st.session_state.last_refresh_time >= 3:  # 3 seconds
+            st.session_state.last_refresh_time = current_time
+            time.sleep(0.5)  # Small delay to avoid too rapid refreshes
+            st.rerun()
+
+
+def render_plan_editor():
+    """Render the presentation plan editor dialog."""
+    task = get_current_task()
+    if not task:
+        return
+    
+    if not st.session_state.show_plan_editor:
+        return
+    
+    st.subheader("📝 编辑演示文稿规划")
+    
+    st.markdown("""
+    **Architect Agent 已完成规划。** 请检查以下 JSON 内容，您可以：
+    - 修改幻灯片的标题、内容和类型
+    - 调整幻灯片的顺序（修改 id）
+    - 添加或删除幻灯片
+    - 修改主题颜色
+    
+    确认无误后，点击"确认并生成"开始生成幻灯片。
+    """)
+    
+    # Show error if any
+    if st.session_state.plan_editor_error:
+        st.error(f"❌ {st.session_state.plan_editor_error}")
+    
+    # JSON editor
+    plan_content = st.session_state.pending_presentation_plan or ""
+    
+    # Try to format the JSON for better readability
+    try:
+        parsed = json.loads(plan_content)
+        formatted_content = json.dumps(parsed, ensure_ascii=False, indent=2)
+    except:
+        formatted_content = plan_content
+    
+    edited_plan = st.text_area(
+        "演示文稿规划 (JSON)",
+        value=formatted_content,
+        height=400,
+        key="plan_editor_textarea",
+        help="这是 Architect Agent 生成的演示文稿规划，您可以直接编辑 JSON 内容"
+    )
+    
+    # Preview slide count
+    try:
+        preview_plan = json.loads(edited_plan)
+        slide_count = len(preview_plan.get("slides", []))
+        theme = preview_plan.get("theme", {})
+        st.caption(f"📊 共 {slide_count} 页幻灯片 | 主题: {theme.get('color_palette', '默认')}")
+        
+        # Show slide titles
+        with st.expander("查看幻灯片列表", expanded=False):
+            for i, slide in enumerate(preview_plan.get("slides", [])):
+                slide_type = slide.get("type", "unknown")
+                slide_title = slide.get("title", f"幻灯片 {i+1}")
+                st.markdown(f"{i+1}. **[{slide_type}]** {slide_title}")
+    except:
+        st.caption("⚠️ JSON 格式无效，请检查语法")
+    
+    st.divider()
+    
+    # Action buttons
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col1:
+        if st.button("✅ 确认并生成", type="primary", use_container_width=True):
+            confirm_and_start_generation(task, edited_plan)
+            st.rerun()
+    
+    with col2:
+        if st.button("🔄 重新生成规划", use_container_width=True):
+            # Clear the editor and re-run architect
+            st.session_state.show_plan_editor = False
+            st.session_state.pending_presentation_plan = None
+            st.session_state.plan_editor_error = None
+            st.session_state.current_phase = "architect"
+            st.info("请在聊天中发送新的指令来重新生成规划")
+            st.rerun()
+    
+    with col3:
+        if st.button("❌ 取消", use_container_width=True):
+            st.session_state.show_plan_editor = False
+            st.session_state.pending_presentation_plan = None
+            st.session_state.plan_editor_error = None
+            st.session_state.current_phase = "collecting"
+            st.rerun()
+
+
 def render_preview_panel():
     """Render the HTML preview panel."""
     task = get_current_task()
@@ -1039,7 +1678,23 @@ def render_preview_panel():
         st.info("📄 选择任务后将显示预览")
         return
     
+    # Check if we should show the plan editor instead
+    if st.session_state.show_plan_editor:
+        render_plan_editor()
+        return
+    
     st.subheader("🖼️ 预览")
+    
+    # Check for multi-file slides
+    slides_dir = get_slides_dir(task)
+    slide_files = get_slide_files(task) if slides_dir else []
+    
+    # Show export button if slides exist
+    if slide_files:
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("📦 导出", use_container_width=True, help="合并为单个 HTML 文件"):
+                export_slides(task)
     
     html_content = get_html_content()
     
@@ -1105,24 +1760,653 @@ def render_preview_panel():
             st.error(f"渲染预览时出错: {e}")
     
     else:
-        st.info("📄 未找到 HTML 文件。开始对话以创建一个!")
+        # Check if we have multi-file slides to show
+        if slide_files:
+            render_multi_slide_preview(task, slide_files)
+        else:
+            st.info("📄 未找到 HTML 文件。开始对话以创建一个!")
+            
+            # Show a placeholder
+            st.markdown("""
+            <div style="
+                height: 400px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 10px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: white;
+                font-size: 1.5rem;
+                text-align: center;
+            ">
+                🎨 您的演示文稿将在这里显示
+            </div>
+            """, unsafe_allow_html=True)
+
+
+def render_multi_slide_preview(task: Task, slide_files: List[Path]):
+    """Render preview for multi-file slides."""
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        return
+    
+    # Slide status
+    status = get_slide_status_summary(slides_dir)
+    if "error" not in status:
+        total = status.get("total", len(slide_files))
+        completed = status.get("completed", 0)
         
-        # Show a placeholder
-        st.markdown("""
-        <div style="
-            height: 400px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-size: 1.5rem;
-            text-align: center;
-        ">
-            🎨 您的演示文稿将在这里显示
-        </div>
-        """, unsafe_allow_html=True)
+        st.progress(completed / max(total, 1), text=f"已完成 {completed}/{total} 页")
+    
+    # Slide selector
+    st.caption(f"📊 共 {len(slide_files)} 页幻灯片")
+    
+    cols = st.columns(min(len(slide_files), 10))
+    for i, slide_file in enumerate(slide_files[:10]):
+        with cols[i]:
+            btn_type = "primary" if i == task.selected_slide else "secondary"
+            if st.button(f"{i + 1}", key=f"mslide_{i}", use_container_width=True, type=btn_type):
+                st.session_state.task_manager.update_task(task.id, selected_slide=i)
+                st.rerun()
+    
+    if len(slide_files) > 10:
+        st.caption("(显示前 10 页)")
+    
+    st.divider()
+    
+    # Show selected slide
+    selected_idx = min(task.selected_slide, len(slide_files) - 1)
+    if selected_idx >= 0:
+        slide_content = get_slide_content(task, selected_idx)
+        if slide_content:
+            try:
+                components.html(slide_content, height=600, scrolling=True)
+            except Exception as e:
+                st.error(f"渲染幻灯片时出错: {e}")
+        else:
+            st.info("⏳ 该幻灯片正在生成中...")
+    
+    # Slide modification
+    with st.expander("✏️ 修改当前幻灯片", expanded=False):
+        refinement_input = st.text_area(
+            "修改请求",
+            placeholder=f"您希望如何修改第 {selected_idx + 1} 页?",
+            height=80,
+            key="multi_refinement_input"
+        )
+        
+        if st.button("🔄 应用修改", use_container_width=True, key="multi_refine_btn"):
+            if refinement_input.strip():
+                regenerate_slide(task, selected_idx, refinement_input.strip())
+
+
+def export_slides(task: Task):
+    """Export multi-file slides to a single HTML file."""
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        st.error("未找到幻灯片目录")
+        return
+    
+    generator = create_slide_generator(task)
+    if not generator:
+        st.error("无法创建导出器")
+        return
+    
+    try:
+        output_path = generator.export_to_single_file(slides_dir)
+        st.success(f"✅ 导出成功: {output_path}")
+        
+        # Update task html_file to point to exported file
+        relative_path = output_path.relative_to(Path(task.workspace_dir))
+        st.session_state.task_manager.update_task(task.id, html_file=str(relative_path))
+        st.session_state.preview_key += 1
+        st.rerun()
+    except Exception as e:
+        st.error(f"导出失败: {e}")
+
+
+def validate_presentation_plan(plan_json: str) -> Tuple[bool, Optional[dict], Optional[str]]:
+    """
+    Validate a presentation plan JSON string.
+    
+    Args:
+        plan_json: JSON string to validate
+        
+    Returns:
+        Tuple of (is_valid, parsed_plan, error_message)
+    """
+    try:
+        plan = json.loads(plan_json)
+    except json.JSONDecodeError as e:
+        return False, None, f"JSON 解析错误: {str(e)}"
+    
+    # Check required fields
+    if not isinstance(plan, dict):
+        return False, None, "JSON 必须是一个对象"
+    
+    if "slides" not in plan:
+        return False, None, "缺少必需的 'slides' 字段"
+    
+    if not isinstance(plan.get("slides"), list):
+        return False, None, "'slides' 必须是一个数组"
+    
+    if len(plan.get("slides", [])) == 0:
+        return False, None, "'slides' 数组不能为空"
+    
+    # Validate each slide
+    for i, slide in enumerate(plan.get("slides", [])):
+        if not isinstance(slide, dict):
+            return False, None, f"第 {i+1} 个幻灯片必须是一个对象"
+        
+        if "id" not in slide:
+            return False, None, f"第 {i+1} 个幻灯片缺少 'id' 字段"
+        
+        if "type" not in slide:
+            return False, None, f"第 {i+1} 个幻灯片缺少 'type' 字段"
+        
+        if "title" not in slide:
+            return False, None, f"第 {i+1} 个幻灯片缺少 'title' 字段"
+    
+    # Check theme (optional but recommended)
+    if "theme" not in plan:
+        # Add default theme
+        plan["theme"] = {
+            "color_palette": "Modern Blue",
+            "background_class": "bg-slate-900",
+            "text_primary": "text-white",
+            "text_accent": "text-blue-400"
+        }
+    
+    return True, plan, None
+
+
+def handle_phase_complete(task: Task, phase: str, summary: str, live_container=None):
+    """
+    Handle phase completion and transition to the next phase.
+    
+    Args:
+        task: The current task
+        phase: The phase that was completed ('collecting', 'architect')
+        summary: Summary from the completed phase
+        live_container: Container for live updates
+    """
+    task_manager = st.session_state.task_manager
+    
+    if phase == "collecting":
+        # Transition to Architect phase
+        st.session_state.current_phase = "architect"
+        
+        if live_container:
+            with live_container.container():
+                st.info("📐 正在规划演示文稿结构...")
+        
+        # Run Architect agent
+        run_architect_phase(task, summary, live_container)
+        
+    elif phase == "architect":
+        # Read the presentation plan and show editor
+        plan_path = Path(task.workspace_dir) / "slides" / "presentation_plan.json"
+        
+        if plan_path.exists():
+            try:
+                plan_content = plan_path.read_text(encoding='utf-8')
+                st.session_state.pending_presentation_plan = plan_content
+                st.session_state.show_plan_editor = True
+                st.session_state.plan_editor_error = None
+                st.session_state.current_phase = "editing_plan"
+                
+                if live_container:
+                    with live_container.container():
+                        st.info("📝 请检查并编辑演示文稿规划，然后点击确认继续...")
+            except Exception as e:
+                if live_container:
+                    with live_container.container():
+                        st.error(f"读取演示文稿规划失败: {e}")
+        else:
+            if live_container:
+                with live_container.container():
+                    st.error("未找到 presentation_plan.json 文件")
+
+
+def confirm_and_start_generation(task: Task, plan_json: str):
+    """
+    Validate the edited plan and start slide generation in background.
+    
+    Args:
+        task: The current task
+        plan_json: The edited JSON string
+    """
+    # Validate the JSON
+    is_valid, plan, error = validate_presentation_plan(plan_json)
+    
+    if not is_valid:
+        st.session_state.plan_editor_error = error
+        return
+    
+    # Save the edited plan
+    plan_path = Path(task.workspace_dir) / "slides" / "presentation_plan.json"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+    
+    # IMPORTANT: Create slide framework SYNCHRONOUSLY before starting background thread
+    # This creates manifest.json with all slides in "pending" status
+    # so the grid view can immediately show all slides
+    generator = create_slide_generator(task)
+    if generator:
+        try:
+            generator.create_slide_framework(plan)
+            print(f"Created slide framework with {len(plan.get('slides', []))} slides")
+        except Exception as e:
+            print(f"Error creating slide framework: {e}")
+            st.session_state.plan_editor_error = f"创建幻灯片框架失败: {e}"
+            return
+    
+    # Clear editor state and transition to designing phase
+    st.session_state.pending_presentation_plan = None
+    st.session_state.show_plan_editor = False
+    st.session_state.plan_editor_error = None
+    st.session_state.current_phase = "designing"
+    st.session_state.slide_generation_in_progress = True
+    
+    # Capture configuration from session state before starting thread
+    # (Thread cannot safely access session_state)
+    api_key = st.session_state.api_key
+    base_url = st.session_state.base_url
+    model = st.session_state.model
+    concurrency = st.session_state.slide_concurrency
+    timeout = st.session_state.slide_timeout
+    workspace_dir = task.workspace_dir
+    
+    # Start content generation in background thread
+    # Note: slide framework is already created, this only generates content
+    def run_generation():
+        try:
+            trigger_slide_generation_background(
+                workspace_dir=workspace_dir,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                concurrency=concurrency,
+                timeout=timeout,
+                skip_framework=True  # Framework already created
+            )
+        except Exception as e:
+            print(f"Background slide generation error: {e}")
+    
+    thread = threading.Thread(target=run_generation, daemon=True)
+    thread.start()
+    
+    # Note: st.rerun() is called after this function returns
+
+
+def trigger_slide_generation_background(
+    workspace_dir: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    concurrency: int,
+    timeout: float,
+    skip_framework: bool = False
+):
+    """
+    Run slide generation in background thread.
+    Does not use any Streamlit components - only updates manifest.json.
+    
+    Args:
+        workspace_dir: Path to the workspace directory
+        api_key: OpenAI API key
+        base_url: OpenAI base URL (optional)
+        model: Model name
+        concurrency: Number of concurrent slide generations
+        timeout: Timeout per slide in seconds
+        skip_framework: If True, skip creating framework (already created)
+    """
+    plan_path = Path(workspace_dir) / "slides" / "presentation_plan.json"
+    
+    if not plan_path.exists():
+        print(f"Plan file not found: {plan_path}")
+        return
+    
+    # Parse the plan
+    plan = parse_presentation_plan(plan_path)
+    if not plan:
+        print("Failed to parse presentation plan")
+        return
+    
+    # Create slide generator
+    generator = SlideGenerator(
+        api_key=api_key,
+        workspace_dir=workspace_dir,
+        model=model,
+        base_url=base_url if base_url else None,
+        concurrency=concurrency,
+        task_timeout=timeout
+    )
+    
+    slides_dir = Path(workspace_dir) / "slides"
+    
+    # Create framework only if not skipped
+    if not skip_framework:
+        try:
+            generator.create_slide_framework(plan)
+            print(f"Created slide framework in {slides_dir}")
+        except Exception as e:
+            print(f"Error creating framework: {e}")
+            return
+    
+    def create_designer_agent(system_prompt: str) -> Agent:
+        return Agent(
+            api_key=api_key,
+            workspace_dir=workspace_dir,
+            model=model,
+            base_url=base_url if base_url else None,
+            system_prompt_override=system_prompt
+        )
+    
+    # Run concurrent generation
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        stats = loop.run_until_complete(
+            generator.generate_slides_concurrent(
+                plan=plan,
+                slides_dir=slides_dir,
+                create_agent_func=create_designer_agent
+            )
+        )
+        
+        loop.close()
+        
+        print(f"Slide generation complete: {stats}")
+        
+    except Exception as e:
+        print(f"Error generating slides: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def run_architect_phase(task: Task, collector_summary: str, live_container=None):
+    """
+    Run the Architect phase to create presentation_plan.json.
+    
+    Args:
+        task: The current task
+        collector_summary: Summary from the information collection phase
+        live_container: Container for live updates
+    """
+    # Get the existing agent (with conversation history)
+    agent = get_or_create_agent(task)
+    if agent is None:
+        if live_container:
+            with live_container.container():
+                st.error("无法创建 Architect Agent")
+        return
+    
+    # Load Architect prompt from the code directory (where app.py is located)
+    code_dir = Path(__file__).parent.resolve()
+    architect_prompt_path = code_dir / "Architect_prompt.md"
+    
+    if architect_prompt_path.exists():
+        architect_prompt = architect_prompt_path.read_text(encoding='utf-8')
+    else:
+        if live_container:
+            with live_container.container():
+                st.error("未找到 Architect_prompt.md")
+        return
+    
+    # Switch system prompt while keeping conversation history
+    original_prompt = agent.system_prompt
+    tool_definitions = agent.tools.get_tool_definitions_json()
+    agent.system_prompt = f"{architect_prompt}\n\n{tool_definitions}"
+    
+    task_manager = st.session_state.task_manager
+    
+    # Create the task for Architect
+    architect_task = f"""基于之前收集的信息，请创建演示文稿规划。
+
+收集阶段摘要：
+{collector_summary}
+
+请执行以下步骤：
+1. 分析收集到的信息
+2. 规划幻灯片结构（8-15页）
+3. 使用 write_file 写入 slides/presentation_plan.json
+4. 完成后调用 phase_complete(phase="architect", summary="...")
+
+确保创建 slides 目录（如果不存在）。
+"""
+    
+    # Run the agent
+    try:
+        for event in agent.run(architect_task, stream=True):
+            event_type = event.get("type")
+            
+            # Convert ToolCallInfo to dict for serialization
+            if event_type in ["tool_call", "tool_result"]:
+                tc = event.get("tool_call")
+                if tc and not isinstance(tc, dict):
+                    event = {
+                        "type": event_type,
+                        "tool_call": {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            "result": {
+                                "success": tc.result.success if tc.result else False,
+                                "data": tc.result.data if tc.result else None,
+                                "error": tc.result.error if tc.result else None
+                            } if tc.result else None
+                        }
+                    }
+            
+            # Save to history
+            if event_type not in ["streaming_delta"]:
+                if event_type == "streaming_complete":
+                    content = event.get("content", "")
+                    if content:
+                        task_manager.add_chat_message(task.id, {"type": "assistant_message", "content": content})
+                else:
+                    task_manager.add_chat_message(task.id, event)
+            
+            # Check for phase_complete
+            if event_type == "tool_result":
+                tc = event.get("tool_call")
+                if tc:
+                    tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                    if tc_name == "phase_complete":
+                        tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                        if tc_result:
+                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else (tc_result.data if hasattr(tc_result, 'data') else None)
+                            if result_data and result_data.get("phase") == "architect":
+                                # Trigger slide generation
+                                handle_phase_complete(task, "architect", result_data.get("summary", ""), live_container)
+                                break
+                    elif tc_name == "write_file":
+                        # Check if presentation_plan.json was written
+                        tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                        if tc_args:
+                            files_written = tc_args.get("files", [])
+                            for file_entry in files_written:
+                                file_path = file_entry.get("path", "") if isinstance(file_entry, dict) else ""
+                                if "presentation_plan.json" in file_path:
+                                    st.session_state.preview_key += 1
+    
+    except Exception as e:
+        if live_container:
+            with live_container.container():
+                st.error(f"Architect 阶段出错: {e}")
+    
+    finally:
+        # Restore original prompt (optional, since agent is cached)
+        pass
+
+
+def trigger_slide_generation(task: Task, live_container=None):
+    """
+    Trigger the slide generation process after presentation_plan.json is written.
+    
+    This function:
+    1. Reads the presentation_plan.json
+    2. Creates empty slide templates
+    3. Generates content for each slide concurrently
+    """
+    plan_path = Path(task.workspace_dir) / "slides" / "presentation_plan.json"
+    
+    if not plan_path.exists():
+        if live_container:
+            with live_container.container():
+                st.error("未找到 presentation_plan.json")
+        return
+    
+    # Parse the plan
+    plan = parse_presentation_plan(plan_path)
+    if not plan:
+        if live_container:
+            with live_container.container():
+                st.error("无法解析 presentation_plan.json")
+        return
+    
+    # Create slide generator
+    generator = create_slide_generator(task)
+    if not generator:
+        if live_container:
+            with live_container.container():
+                st.error("无法创建 SlideGenerator")
+        return
+    
+    slides_dir = Path(task.workspace_dir) / "slides"
+    
+    # Phase 2: Create framework
+    if live_container:
+        with live_container.container():
+            st.info("📝 正在创建幻灯片框架...")
+    
+    try:
+        generator.create_slide_framework(plan)
+    except Exception as e:
+        if live_container:
+            with live_container.container():
+                st.error(f"创建框架失败: {e}")
+        return
+    
+    # Phase 3: Generate slides concurrently
+    if live_container:
+        with live_container.container():
+            st.info("🎨 正在生成幻灯片内容...")
+            progress_placeholder = st.empty()
+    
+    def create_designer_agent(system_prompt: str) -> Agent:
+        return Agent(
+            api_key=st.session_state.api_key,
+            workspace_dir=task.workspace_dir,
+            model=st.session_state.model,
+            base_url=st.session_state.base_url if st.session_state.base_url else None,
+            system_prompt_override=system_prompt
+        )
+    
+    # Run concurrent generation
+    try:
+        # Use asyncio to run the concurrent generation
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        stats = loop.run_until_complete(
+            generator.generate_slides_concurrent(
+                plan=plan,
+                slides_dir=slides_dir,
+                create_agent_func=create_designer_agent
+            )
+        )
+        
+        loop.close()
+        
+        # Show results
+        if live_container:
+            with live_container.container():
+                if stats["failed"] == 0:
+                    st.success(f"✅ 已生成 {stats['success']}/{stats['total']} 页幻灯片")
+                else:
+                    st.warning(
+                        f"⚠️ 已生成 {stats['success']}/{stats['total']} 页，"
+                        f"{stats['failed']} 页失败"
+                    )
+                    for err in stats.get("errors", []):
+                        st.error(f"Slide {err['slide_id']}: {err['error']}")
+        
+        st.session_state.slide_generation_stats = stats
+        st.session_state.preview_key += 1
+        
+    except Exception as e:
+        if live_container:
+            with live_container.container():
+                st.error(f"生成幻灯片失败: {e}")
+
+
+def regenerate_slide(task: Task, slide_index: int, feedback: str):
+    """Regenerate a specific slide with user feedback."""
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        st.error("未找到幻灯片目录")
+        return
+    
+    # Get slide ID from manifest
+    manifest_path = slides_dir / "manifest.json"
+    if not manifest_path.exists():
+        st.error("未找到 manifest.json")
+        return
+    
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        slides = manifest.get("slides", [])
+        if slide_index >= len(slides):
+            st.error("幻灯片索引无效")
+            return
+        
+        slide_id = slides[slide_index].get("id")
+    except Exception as e:
+        st.error(f"读取 manifest 失败: {e}")
+        return
+    
+    # Create generator and regenerate
+    generator = create_slide_generator(task)
+    if not generator:
+        st.error("无法创建生成器")
+        return
+    
+    def create_designer_agent(system_prompt: str) -> Agent:
+        return Agent(
+            api_key=st.session_state.api_key,
+            workspace_dir=task.workspace_dir,
+            model=st.session_state.model,
+            base_url=st.session_state.base_url if st.session_state.base_url else None,
+            system_prompt_override=system_prompt
+        )
+    
+    st.session_state.is_processing = True
+    task_manager = st.session_state.task_manager
+    
+    try:
+        for event in generator.regenerate_slide(
+            slides_dir=slides_dir,
+            slide_id=slide_id,
+            user_feedback=feedback,
+            create_agent_func=create_designer_agent
+        ):
+            event_type = event.get("type")
+            
+            if event_type == "error":
+                st.error(event.get("error", "未知错误"))
+            elif event_type == "task_completed":
+                st.success("✅ 幻灯片已更新")
+                st.session_state.preview_key += 1
+    
+    except Exception as e:
+        st.error(f"重新生成失败: {e}")
+    
+    finally:
+        st.session_state.is_processing = False
+        st.rerun()
 
 
 def refine_current_slide(task: Task, feedback: str, live_container=None):
@@ -1294,16 +2578,32 @@ def main():
     
     # Main content area
     st.title("🎨 AI Presentation Agent")
-    st.caption("使用 AI 创建数据驱动的 HTML 演示文稿")
     
-    # Create two columns for chat and preview
-    col1, col2 = st.columns([1, 1])
+    # Route based on current phase
+    current_phase = st.session_state.current_phase
     
-    with col1:
-        render_chat_panel()
+    if current_phase in ["designing", "completed"]:
+        # Show grid view for slide monitoring and editing
+        st.caption("幻灯片生成与编辑")
+        render_grid_view()
     
-    with col2:
-        render_preview_panel()
+    elif current_phase == "editing_plan":
+        # Show plan editor
+        st.caption("编辑演示文稿规划")
+        render_plan_editor()
+    
+    else:
+        # Show chat view for collecting and architect phases
+        st.caption("使用 AI 创建数据驱动的 HTML 演示文稿")
+        
+        # Create two columns for chat and preview
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            render_chat_panel()
+        
+        with col2:
+            render_preview_panel()
     
     # Processing indicator
     if st.session_state.is_processing:

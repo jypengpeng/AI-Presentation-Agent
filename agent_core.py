@@ -176,6 +176,14 @@ class ExecuteCommandResult:
     killed: bool = False
 
 
+@dataclass
+class PhaseCompleteResult:
+    """Result of phase_complete operation"""
+    phase: str
+    summary: str
+    success: bool = True
+
+
 # ============================================================================
 # File Truncation Constants
 # ============================================================================
@@ -953,6 +961,33 @@ class AgentTools:
             }
         )
     
+    def phase_complete(self, phase: str, summary: str) -> ToolResult:
+        """
+        Signal that the current phase is complete and ready to transition.
+        
+        Args:
+            phase: The phase that was completed ('collecting', 'architect', 'designer')
+            summary: Summary of what was accomplished in this phase
+            
+        Returns:
+            ToolResult indicating phase completion
+        """
+        valid_phases = ['collecting', 'architect', 'designer']
+        if phase not in valid_phases:
+            return ToolResult(
+                success=False,
+                error=f"Invalid phase: {phase}. Must be one of: {valid_phases}"
+            )
+        
+        return ToolResult(
+            success=True,
+            data={
+                'phase_complete': True,
+                'phase': phase,
+                'summary': summary
+            }
+        )
+    
     # =========================================================================
     # Tool Definitions for JSON Boundary Marker Format
     # =========================================================================
@@ -1076,6 +1111,26 @@ class AgentTools:
                     "tool": "inspect_csv_head",
                     "parameters": {"path": "data/sales.csv", "rows": 10}
                 }
+            },
+            {
+                "name": "phase_complete",
+                "description": "Signal that the current phase of work is complete. Use this to transition to the next phase in the workflow. Valid phases: 'collecting' (information gathering complete), 'architect' (presentation plan complete).",
+                "parameters": {
+                    "phase": {
+                        "type": "string",
+                        "required": True,
+                        "description": "The phase that was completed. One of: 'collecting', 'architect'"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "required": True,
+                        "description": "Summary of what was accomplished in this phase and any important information to pass to the next phase."
+                    }
+                },
+                "example": {
+                    "tool": "phase_complete",
+                    "parameters": {"phase": "collecting", "summary": "Analyzed the project: it's a Python data analysis project with 3 CSV files..."}
+                }
             }
         ]
         
@@ -1162,6 +1217,10 @@ You can call multiple tools by outputting multiple tool blocks:
             'inspect_csv_head': lambda args: self.inspect_csv_head(
                 path=args.get('path', ''),
                 rows=args.get('rows', 5)
+            ),
+            'phase_complete': lambda args: self.phase_complete(
+                phase=args.get('phase', ''),
+                summary=args.get('summary', '')
             )
         }
         
@@ -1217,7 +1276,8 @@ class Agent:
         base_url: Optional[str] = None,
         on_tool_call: Optional[Callable[[ToolCallInfo], None]] = None,
         on_message: Optional[Callable[[str, str], None]] = None,
-        enable_thinking: Optional[bool] = None
+        enable_thinking: Optional[bool] = None,
+        system_prompt_override: Optional[str] = None
     ):
         """
         Initialize the Agent.
@@ -1234,6 +1294,8 @@ class Agent:
                            None = auto-detect (disabled for proxies/custom base_url)
                            True = force enable
                            False = force disable
+            system_prompt_override: If provided, use this string as the system prompt
+                                   instead of loading from system_prompt_path
         """
         self.model = model
         self.workspace_dir = Path(workspace_dir).resolve()
@@ -1264,7 +1326,10 @@ class Agent:
         self.tools = AgentTools(workspace_dir)
         
         # Load system prompt and append tool definitions
-        base_prompt = self._load_system_prompt(system_prompt_path)
+        if system_prompt_override:
+            base_prompt = system_prompt_override
+        else:
+            base_prompt = self._load_system_prompt(system_prompt_path)
         tool_definitions = self.tools.get_tool_definitions_json()
         self.system_prompt = f"{base_prompt}\n\n{tool_definitions}"
         
@@ -1594,14 +1659,22 @@ class Agent:
             return messages
         
     def _load_system_prompt(self, path: str) -> str:
-        """Load the system prompt from a file."""
-        prompt_path = self.workspace_dir / path
+        """Load the system prompt from the project directory (where agent_core.py is located).
+        
+        Note: We always load from the project root, not the task workspace directory,
+        because the workspace is the user's project being analyzed (which won't have our prompts).
+        """
+        # Load from the code directory (where agent_core.py is located)
+        code_dir = Path(__file__).parent.resolve()
+        prompt_path = code_dir / path
         
         if prompt_path.exists():
+            logger.info(f"[PROMPT] Loading system prompt: {prompt_path}")
             return prompt_path.read_text(encoding='utf-8')
-        else:
-            # Default system prompt if file not found
-            return """You are an autonomous AI agent that helps users create data-driven HTML presentations.
+        
+        # Fallback to default system prompt (should not happen in normal operation)
+        logger.error(f"[PROMPT] System prompt file not found: {prompt_path}, using default fallback")
+        return """You are an autonomous AI agent that helps users create data-driven HTML presentations.
 
 You have access to the following tools:
 - list_files: List files and directories
