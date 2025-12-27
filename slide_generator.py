@@ -706,6 +706,8 @@ class SlideGenerator:
                 except asyncio.TimeoutError:
                     completed_count += 1
                     logger.error(f"[{slide_id}] Generation TIMEOUT after {self.retry_config.task_timeout}s ({completed_count}/{total_slides})")
+                    # 立即更新 manifest 状态
+                    self._update_manifest_status(slides_dir, slide_id, "failed")
                     return GenerationResult(
                         success=False,
                         slide_id=slide_id,
@@ -715,6 +717,8 @@ class SlideGenerator:
                 except Exception as e:
                     completed_count += 1
                     logger.error(f"[{slide_id}] Generation FAILED with exception: {e} ({completed_count}/{total_slides})")
+                    # 立即更新 manifest 状态
+                    self._update_manifest_status(slides_dir, slide_id, "failed")
                     return GenerationResult(
                         success=False,
                         slide_id=slide_id,
@@ -752,12 +756,12 @@ class SlideGenerator:
                     "slide_id": slide_id,
                     "error": str(result)
                 })
-                self._update_manifest_status(slides_dir, slide_id, "failed")
+                # 状态已在 generate_with_semaphore 中更新，这里只做记录
                 logger.error(f"[{slide_id}] Result: Exception - {result}")
             elif isinstance(result, GenerationResult):
                 if result.success:
                     stats["success"] += 1
-                    self._update_manifest_status(slides_dir, slide_id, "completed")
+                    # 状态已在 _generate_single_slide_with_retry 中立即更新
                     logger.info(f"[{slide_id}] Result: SUCCESS (retries={result.retry_count})")
                 else:
                     stats["failed"] += 1
@@ -765,7 +769,7 @@ class SlideGenerator:
                         "slide_id": slide_id,
                         "error": result.error
                     })
-                    self._update_manifest_status(slides_dir, slide_id, "failed")
+                    # 状态已在 _generate_single_slide_with_retry 中立即更新
                     logger.error(f"[{slide_id}] Result: FAILED - {result.error}")
             else:
                 # Unexpected result type
@@ -774,6 +778,8 @@ class SlideGenerator:
                     "slide_id": slide_id,
                     "error": f"Unexpected result type: {type(result)}"
                 })
+                # 确保异常情况也更新状态
+                self._update_manifest_status(slides_dir, slide_id, "failed")
                 logger.error(f"[{slide_id}] Result: UNEXPECTED TYPE - {type(result)}")
         
         logger.info(f"Generation complete: {stats['success']}/{stats['total']} success, {stats['failed']} failed")
@@ -828,10 +834,11 @@ class SlideGenerator:
                 # Use relative path for the task
                 task = self.create_designer_task(slide_id, relative_path)
                 
-                logger.debug(f"[{slide_id}] Calling designer_agent.run_sync()...")
+                logger.debug(f"[{slide_id}] Calling designer_agent.run_sync() in thread pool...")
                 
-                # Run the agent
-                result = designer_agent.run_sync(task)
+                # Run the agent in a thread pool to avoid blocking the event loop
+                # This is critical for true concurrency - run_sync is blocking
+                result = await asyncio.to_thread(designer_agent.run_sync, task)
                 
                 logger.debug(f"[{slide_id}] run_sync() returned: success={result.get('success')}")
                 
@@ -845,6 +852,9 @@ class SlideGenerator:
                             continue  # Retry
                     
                     logger.info(f"[{slide_id}] Successfully generated on attempt {attempt + 1}")
+                    
+                    # 立即更新 manifest 状态，使 UI 能实时显示进度
+                    self._update_manifest_status(slides_dir, slide_id, "completed")
                     
                     if self.on_slide_complete:
                         self.on_slide_complete(slide_id, True)
@@ -871,7 +881,9 @@ class SlideGenerator:
                 logger.debug(f"[{slide_id}] Waiting {delay}s before retry...")
                 await asyncio.sleep(delay)
         
-        # All retries exhausted
+        # All retries exhausted - 立即更新 manifest 状态
+        self._update_manifest_status(slides_dir, slide_id, "failed")
+        
         if self.on_slide_complete:
             self.on_slide_complete(slide_id, False)
         

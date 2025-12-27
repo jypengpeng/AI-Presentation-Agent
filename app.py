@@ -342,6 +342,88 @@ def get_current_task() -> Optional[Task]:
     return st.session_state.task_manager.get_active_task()
 
 
+def infer_task_phase(task: Task) -> str:
+    """
+    Infer the current workflow phase based on task files.
+    
+    This function examines the task's workspace to determine which phase
+    the task is actually in, regardless of what session_state.current_phase says.
+    
+    Returns one of: "collecting", "editing_plan", "designing"
+    """
+    if not task:
+        return "collecting"
+    
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        # No slides directory - still in collecting phase
+        return "collecting"
+    
+    manifest_path = slides_dir / "manifest.json"
+    plan_path = slides_dir / "presentation_plan.json"
+    
+    if not plan_path.exists():
+        # No plan yet - collecting phase
+        return "collecting"
+    
+    if plan_path.exists() and not manifest_path.exists():
+        # Plan exists but no manifest - show plan editor
+        return "editing_plan"
+    
+    # Both plan and manifest exist - check slide statuses
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        slides = manifest.get("slides", [])
+        
+        if not slides:
+            return "collecting"
+        
+        # If manifest has slides, we're in designing phase (grid view)
+        return "designing"
+    except:
+        return "collecting"
+
+
+def sync_phase_with_task():
+    """
+    Synchronize session_state.current_phase with the actual task state.
+    
+    This should be called:
+    1. At the start of main() to handle page refreshes
+    2. When switching tasks
+    3. After certain operations that might change task state
+    """
+    task = get_current_task()
+    if not task:
+        st.session_state.current_phase = "collecting"
+        return
+    
+    # Don't override if we're in a user-initiated editing session
+    # (show_plan_editor is True means user is actively editing the plan)
+    if st.session_state.get("show_plan_editor") and st.session_state.current_phase == "editing_plan":
+        return
+    
+    # Don't override if slide generation is actively in progress
+    if st.session_state.get("slide_generation_in_progress"):
+        return
+    
+    inferred_phase = infer_task_phase(task)
+    
+    # If we have a plan file but show_plan_editor is not set,
+    # and inferred phase is editing_plan, also set show_plan_editor
+    if inferred_phase == "editing_plan":
+        plan_path = Path(task.workspace_dir) / "slides" / "presentation_plan.json"
+        if plan_path.exists():
+            try:
+                plan_content = plan_path.read_text(encoding='utf-8')
+                st.session_state.pending_presentation_plan = plan_content
+                st.session_state.show_plan_editor = True
+            except:
+                pass
+    
+    st.session_state.current_phase = inferred_phase
+
+
 def get_html_content() -> Optional[str]:
     """Get the content of the HTML file for preview."""
     task = get_current_task()
@@ -892,6 +974,12 @@ def render_task_list():
                     if not is_active:
                         task_manager.switch_task(task.id)
                         st.session_state.preview_key += 1
+                        # Reset editor state when switching tasks
+                        st.session_state.show_plan_editor = False
+                        st.session_state.pending_presentation_plan = None
+                        st.session_state.grid_expanded_slide = None
+                        # Sync phase with the new task's actual state
+                        sync_phase_with_task()
                         st.rerun()
             
             with col2:
@@ -2958,6 +3046,9 @@ def main():
     """Main application entry point."""
     # Render sidebar
     render_sidebar()
+    
+    # Sync phase with current task state (handles page refresh, etc.)
+    sync_phase_with_task()
     
     # Main content area
     st.title("🎨 AI Presentation Agent")
