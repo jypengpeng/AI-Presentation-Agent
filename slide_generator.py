@@ -17,6 +17,7 @@ import json
 import asyncio
 import re
 import zipfile
+import threading
 from pathlib import Path
 from typing import Optional, Callable, Any, Generator
 from dataclasses import dataclass, field
@@ -418,6 +419,9 @@ class SlideGenerator:
         
         # Retry configuration with custom timeout
         self.retry_config = RetryConfig(task_timeout=task_timeout)
+        
+        # Lock for thread-safe manifest updates
+        self._manifest_lock = threading.Lock()
     
     def _load_prompt(self, filename: str) -> str:
         """Load a prompt file from the project directory (where slide_generator.py is located).
@@ -629,23 +633,26 @@ class SlideGenerator:
 **你的任务：**
 根据系统提示中提供的 slide 标题和内容描述，创建一个信息密度高、视觉效果专业的幻灯片。
 
-**重要步骤：**
-1. 首先使用 read_file 工具读取当前文件：{relative_path}
+**重要步骤（必须严格按顺序执行）：**
+1. 首先使用 `read_file` 工具读取当前文件：{relative_path}
 2. 分析内容描述，识别其中的数据点、关系、层次结构
 3. 选择合适的视觉组件（卡片、图表、引用框等）来呈现内容
-4. 生成 HTML 内容替换 `<div id="content">` 内的占位符
-5. 使用 write_file 工具将完整的 HTML 写回文件
+4. 使用 `write_file` 工具写入完整的 HTML 文件到：{relative_path}
+
+**⚠️ 重要：你必须使用 write_file 工具来保存文件！**
+- 不要只在回复中输出 HTML 代码
+- 必须调用 write_file 工具，参数格式：{{"files": [{{"path": "{relative_path}", "content": "完整的HTML内容"}}]}}
+- 替换 `<div id="content" class="slide-container">` 内部的占位符内容
 
 **设计原则：**
 - 使用浅色背景（白色/灰色）
 - 信息密度要高，不要浪费空间
 - 使用彩色边框卡片、徽章、引用框等专业组件
 - 参考系统提示中的组件库
-- 保持文件的 HTML 结构完整，只替换 `<div id="content" class="slide-container">` 内部的内容
 
 **输出文件路径：** {relative_path}
 
-完成后不要调用 task_completed，直接结束即可。
+完成后调用 task_completed 工具表示完成。
 """
     
     async def generate_slides_concurrent(
@@ -669,16 +676,20 @@ class SlideGenerator:
         slides = plan.get("slides", [])
         
         # Semaphore for concurrency control
+        # When concurrency is 0 (unlimited), use a reasonable default to avoid API rate limits
         if self.concurrency > 0:
-            semaphore = asyncio.Semaphore(self.concurrency)
+            effective_concurrency = self.concurrency
         else:
-            semaphore = asyncio.Semaphore(len(slides))  # Effectively unlimited
+            # Default to max 3 concurrent to avoid overwhelming the API
+            effective_concurrency = min(3, len(slides))
+        
+        semaphore = asyncio.Semaphore(effective_concurrency)
         
         results = []
         total_slides = len(slides)
         completed_count = 0
         
-        logger.info(f"Starting concurrent generation of {total_slides} slides (concurrency={self.concurrency or 'unlimited'})")
+        logger.info(f"Starting concurrent generation of {total_slides} slides (concurrency={effective_concurrency})")
         
         async def generate_with_semaphore(slide_data: dict, index: int):
             nonlocal completed_count
@@ -834,13 +845,52 @@ class SlideGenerator:
                 # Use relative path for the task
                 task = self.create_designer_task(slide_id, relative_path)
                 
-                logger.debug(f"[{slide_id}] Calling designer_agent.run_sync() in thread pool...")
+                logger.info(f"[{slide_id}] Running designer_agent with streaming...")
                 
-                # Run the agent in a thread pool to avoid blocking the event loop
-                # This is critical for true concurrency - run_sync is blocking
-                result = await asyncio.to_thread(designer_agent.run_sync, task)
+                # Run the agent and collect all events to see what happened
+                def run_and_collect_events():
+                    events = []
+                    tool_calls_made = []
+                    for event in designer_agent.run(task, stream=False):
+                        events.append(event)
+                        event_type = event.get("type")
+                        if event_type == "tool_call":
+                            tc = event.get("tool_call")
+                            if tc:
+                                tool_name = tc.name if hasattr(tc, 'name') else tc.get("name", "")
+                                tool_calls_made.append(tool_name)
+                                logger.info(f"[{slide_id}] Tool called: {tool_name}")
+                        elif event_type == "tool_result":
+                            tc = event.get("tool_call")
+                            if tc:
+                                tool_result = tc.result if hasattr(tc, 'result') else tc.get("result", {})
+                                success = tool_result.success if hasattr(tool_result, 'success') else tool_result.get("success", False)
+                                logger.info(f"[{slide_id}] Tool result: success={success}")
+                        elif event_type == "assistant_message":
+                            content = event.get("content", "")
+                            logger.debug(f"[{slide_id}] Assistant message: {content[:100]}...")
+                    
+                    # Determine final result
+                    last_event = events[-1] if events else {}
+                    final_type = last_event.get("type", "")
+                    
+                    logger.info(f"[{slide_id}] Events count: {len(events)}, Tools called: {tool_calls_made}, Final event type: {final_type}")
+                    
+                    if final_type == "task_completed":
+                        return {"success": True, "result": last_event.get("result", ""), "tools_called": tool_calls_made}
+                    elif final_type == "error":
+                        return {"success": False, "error": last_event.get("error", "Unknown error"), "tools_called": tool_calls_made}
+                    else:
+                        # Check if write_file was called
+                        if "write_file" in tool_calls_made:
+                            return {"success": True, "result": "write_file called", "tools_called": tool_calls_made}
+                        else:
+                            return {"success": False, "error": "write_file was NOT called", "tools_called": tool_calls_made}
                 
-                logger.debug(f"[{slide_id}] run_sync() returned: success={result.get('success')}")
+                # Run in thread pool to avoid blocking
+                result = await asyncio.to_thread(run_and_collect_events)
+                
+                logger.info(f"[{slide_id}] Agent finished: success={result.get('success')}, tools_called={result.get('tools_called')}")
                 
                 if result.get("success"):
                     # Verify that the file was actually updated (not just the placeholder)
@@ -895,33 +945,35 @@ class SlideGenerator:
         )
     
     def _update_manifest_status(self, slides_dir: Path, slide_id: str, status: str):
-        """Update the status of a slide in manifest.json."""
+        """Update the status of a slide in manifest.json (thread-safe)."""
         manifest_path = slides_dir / "manifest.json"
         
         if not manifest_path.exists():
             return
         
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        # Use lock to prevent race conditions when multiple threads update manifest
+        with self._manifest_lock:
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                
+                for slide in manifest.get("slides", []):
+                    if slide.get("id") == slide_id:
+                        slide["status"] = status
+                        if status == "completed":
+                            slide["generated_at"] = datetime.utcnow().isoformat() + "Z"
+                        break
+                
+                # Update counts
+                manifest["completed_slides"] = sum(
+                    1 for s in manifest.get("slides", [])
+                    if s.get("status") == "completed"
+                )
+                manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+                
+                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
             
-            for slide in manifest.get("slides", []):
-                if slide.get("id") == slide_id:
-                    slide["status"] = status
-                    if status == "completed":
-                        slide["generated_at"] = datetime.utcnow().isoformat() + "Z"
-                    break
-            
-            # Update counts
-            manifest["completed_slides"] = sum(
-                1 for s in manifest.get("slides", [])
-                if s.get("status") == "completed"
-            )
-            manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
-            
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-        
-        except Exception as e:
-            logger.error(f"Failed to update manifest: {e}")
+            except Exception as e:
+                logger.error(f"Failed to update manifest: {e}")
     
     # =========================================================================
     # Phase 4: Export - Merge to Single File
@@ -1094,7 +1146,8 @@ class SlideGenerator:
         slides_dir: Path,
         slide_id: str,
         user_feedback: Optional[str] = None,
-        create_agent_func: Optional[Callable] = None
+        create_agent_func: Optional[Callable] = None,
+        stream: bool = True
     ) -> Generator[dict, None, None]:
         """
         Regenerate a single slide, optionally with user feedback.
@@ -1104,9 +1157,10 @@ class SlideGenerator:
             slide_id: ID of the slide to regenerate
             user_feedback: Optional user feedback for modification
             create_agent_func: Function to create a new Agent
+            stream: Whether to enable streaming output (default: True)
         
         Yields:
-            Events from the agent
+            Events from the agent including streaming events
         """
         # Read the plan
         plan_path = slides_dir / "presentation_plan.json"
@@ -1170,7 +1224,8 @@ class SlideGenerator:
             designer_prompt = self.build_designer_prompt(slide_data, tools_json)
             designer_agent = create_agent_func(designer_prompt)
             
-            for event in designer_agent.run(task):
+            # Run with streaming support for real-time feedback
+            for event in designer_agent.run(task, stream=stream):
                 yield event
                 
                 if event.get("type") == "tool_result":

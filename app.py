@@ -1575,6 +1575,9 @@ def render_expanded_slide_view(task: Task, manifest: dict):
             key=f"modify_{slide_id}"
         )
         
+        # Placeholder for streaming output - will be populated during modification
+        streaming_container = st.empty()
+        
         if st.button(
             "🔄 应用修改",
             type="primary",
@@ -1582,10 +1585,7 @@ def render_expanded_slide_view(task: Task, manifest: dict):
             disabled=st.session_state.slide_modification_in_progress
         ):
             if modification_input.strip():
-                apply_slide_modification(task, slide_index, slide_id, modification_input.strip())
-        
-        if st.session_state.slide_modification_in_progress:
-            st.info("⏳ 正在应用修改...")
+                apply_slide_modification(task, slide_index, slide_id, modification_input.strip(), streaming_container)
     
     st.divider()
     
@@ -1605,8 +1605,8 @@ def render_expanded_slide_view(task: Task, manifest: dict):
                 st.rerun()
 
 
-def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedback: str):
-    """Apply modification to a slide using the Designer agent."""
+def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedback: str, streaming_container=None):
+    """Apply modification to a slide using the Designer agent with streaming output."""
     st.session_state.slide_modification_in_progress = True
     
     slides_dir = get_slides_dir(task)
@@ -1632,19 +1632,139 @@ def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedba
             include_image_tool=True  # Enable image generation for Designer agents
         )
     
+    # Track streaming state
+    current_streaming_text = ""
+    live_events = []
+    last_render_time = 0
+    RENDER_THROTTLE_MS = 300
+    
+    def render_streaming_output(force: bool = False):
+        """Render streaming output to the container."""
+        nonlocal last_render_time
+        
+        if streaming_container is None:
+            return
+        
+        # Apply throttling unless forced
+        current_time = time.time() * 1000
+        if not force and (current_time - last_render_time) < RENDER_THROTTLE_MS:
+            return
+        
+        last_render_time = current_time
+        
+        try:
+            with streaming_container.container():
+                # Show streaming indicator
+                st.markdown("**🔄 LLM 响应:**")
+                
+                # Show completed events (tool calls, results)
+                for evt in live_events:
+                    evt_type = evt.get("type")
+                    if evt_type == "tool_call":
+                        tc = evt.get("tool_call")
+                        if tc:
+                            tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                            st.markdown(f"🔧 调用工具: `{tc_name}`")
+                    elif evt_type == "tool_result":
+                        tc = evt.get("tool_call")
+                        if tc:
+                            tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                            if tc_result:
+                                success = tc_result.get("success") if isinstance(tc_result, dict) else tc_result.success
+                                if success:
+                                    st.markdown("✅ 工具执行成功")
+                                else:
+                                    error = tc_result.get("error") if isinstance(tc_result, dict) else tc_result.error
+                                    st.markdown(f"❌ 工具执行失败: {error}")
+                
+                # Show current streaming text
+                if current_streaming_text:
+                    display_text = current_streaming_text
+                    # Truncate if too long
+                    if len(display_text) > 1500:
+                        display_text = display_text[-1500:]
+                        display_text = "...\n" + display_text
+                    
+                    st.markdown(
+                        f"""<div style="
+                            background-color: #f0f7ff;
+                            border: 1px solid #d0e3ff;
+                            border-radius: 8px;
+                            padding: 12px;
+                            max-height: 300px;
+                            overflow-y: auto;
+                            font-family: monospace;
+                            font-size: 12px;
+                            white-space: pre-wrap;
+                            word-wrap: break-word;
+                        ">{display_text}<span style="animation: blink 1s infinite;">▌</span></div>
+                        <style>
+                            @keyframes blink {{
+                                0%, 50% {{ opacity: 1; }}
+                                51%, 100% {{ opacity: 0; }}
+                            }}
+                        </style>
+                        """,
+                        unsafe_allow_html=True
+                    )
+        except Exception:
+            # Ignore rendering errors
+            pass
+    
     try:
+        # Initial render to show loading state
+        if streaming_container:
+            with streaming_container.container():
+                st.markdown("**⏳ 正在处理修改请求...**")
+        
         for event in generator.regenerate_slide(
             slides_dir=slides_dir,
             slide_id=slide_id,
             user_feedback=feedback,
-            create_agent_func=create_designer_agent
+            create_agent_func=create_designer_agent,
+            stream=True  # Enable streaming
         ):
             event_type = event.get("type")
+            
+            # Handle streaming events
+            if event_type == "streaming_delta":
+                current_streaming_text = event.get("accumulated", "")
+                render_streaming_output(force=False)
+                continue
+            
+            elif event_type == "streaming_complete":
+                # Clear streaming text, content is now complete
+                current_streaming_text = ""
+                render_streaming_output(force=True)
+                continue
+            
+            # Convert ToolCallInfo to dict for display
+            if event_type in ["tool_call", "tool_result"]:
+                tc = event.get("tool_call")
+                if tc and not isinstance(tc, dict):
+                    event = {
+                        "type": event_type,
+                        "tool_call": {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            "result": {
+                                "success": tc.result.success if tc.result else False,
+                                "data": tc.result.data if tc.result else None,
+                                "error": tc.result.error if tc.result else None
+                            } if tc.result else None
+                        }
+                    }
+                
+                live_events.append(event)
+                render_streaming_output(force=True)
             
             if event_type == "error":
                 st.error(event.get("error", "未知错误"))
             elif event_type == "task_completed":
-                st.success("✅ 幻灯片已更新")
+                if streaming_container:
+                    with streaming_container.container():
+                        st.success("✅ 幻灯片已更新")
                 st.session_state.preview_key += 1
     
     except Exception as e:
