@@ -1775,6 +1775,79 @@ def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedba
         st.rerun()
 
 
+def regenerate_all_slides_from_plan(task: Task):
+    """
+    Regenerate all slides using the existing presentation_plan.json.
+    
+    This function:
+    1. Reads the existing presentation_plan.json
+    2. Resets all slide statuses to pending in manifest.json
+    3. Starts background slide generation
+    """
+    from datetime import datetime
+    
+    slides_dir = get_slides_dir(task)
+    if not slides_dir:
+        st.error("未找到幻灯片目录")
+        return False
+    
+    plan_path = slides_dir / "presentation_plan.json"
+    if not plan_path.exists():
+        st.error("未找到演示文稿规划文件")
+        return False
+    
+    # Parse the plan
+    plan = parse_presentation_plan(plan_path)
+    if not plan:
+        st.error("无法解析演示文稿规划")
+        return False
+    
+    # Reset all slide statuses to pending in manifest.json
+    manifest_path = slides_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            for slide in manifest.get("slides", []):
+                slide["status"] = "pending"
+                slide["generated_at"] = None
+            manifest["completed_slides"] = 0
+            manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as e:
+            st.error(f"重置幻灯片状态失败: {e}")
+            return False
+    
+    # Start background generation
+    st.session_state.slide_generation_in_progress = True
+    
+    # Capture configuration
+    api_key = st.session_state.api_key
+    base_url = st.session_state.base_url
+    model = st.session_state.model
+    concurrency = st.session_state.slide_concurrency
+    timeout = st.session_state.slide_timeout
+    workspace_dir = task.workspace_dir
+    
+    def run_generation():
+        try:
+            trigger_slide_generation_background(
+                workspace_dir=workspace_dir,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                concurrency=concurrency,
+                timeout=timeout,
+                skip_framework=True  # Use existing framework, just regenerate content
+            )
+        except Exception as e:
+            print(f"Background slide regeneration error: {e}")
+    
+    thread = threading.Thread(target=run_generation, daemon=True)
+    thread.start()
+    
+    return True
+
+
 def render_grid_view():
     """Render the full-screen grid view for slide monitoring and editing."""
     task = get_current_task()
@@ -1845,8 +1918,8 @@ def render_grid_view():
     
     st.divider()
     
-    # Action buttons
-    col1, col2, col3 = st.columns([2, 2, 1])
+    # Action buttons - two rows for better organization
+    col1, col2, col3 = st.columns([2, 2, 2])
     
     with col1:
         if st.button("📦 导出为单文件", use_container_width=True, disabled=(completed < total)):
@@ -1858,7 +1931,39 @@ def render_grid_view():
             st.rerun()
     
     with col3:
-        if st.button("🔙 重新开始", use_container_width=True):
+        # Show regenerate button only when not actively generating
+        has_active_generation = generating > 0 or st.session_state.slide_generation_in_progress
+        if st.button(
+            "🔁 重新生成全部",
+            use_container_width=True,
+            disabled=has_active_generation,
+            help="使用现有规划重新生成所有幻灯片"
+        ):
+            if regenerate_all_slides_from_plan(task):
+                st.success("✅ 已开始重新生成所有幻灯片")
+                st.rerun()
+    
+    # Second row of action buttons
+    col4, col5, col6 = st.columns([2, 2, 2])
+    
+    with col4:
+        if st.button("📝 编辑规划", use_container_width=True, help="返回编辑演示文稿规划"):
+            # Load the plan into editor
+            slides_dir = get_slides_dir(task)
+            if slides_dir:
+                plan_path = slides_dir / "presentation_plan.json"
+                if plan_path.exists():
+                    try:
+                        plan_content = plan_path.read_text(encoding='utf-8')
+                        st.session_state.pending_presentation_plan = plan_content
+                        st.session_state.show_plan_editor = True
+                        st.session_state.current_phase = "editing_plan"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"读取规划文件失败: {e}")
+    
+    with col6:
+        if st.button("🔙 重新开始", use_container_width=True, help="返回对话页面重新开始"):
             st.session_state.current_phase = "collecting"
             st.session_state.grid_expanded_slide = None
             st.rerun()

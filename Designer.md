@@ -175,6 +175,42 @@ The aim is not just to present data and information, but to make the experience 
 
 ---
 
+## Visual Editor Compatibility
+
+To support precise control in visual editors, follow these rules:
+
+### 1. Unique IDs
+Every editable element MUST have a unique `id`:
+- Cards: `id="card-1"`, `id="card-2"`
+- Titles: `id="title-main"`, `id="title-sub"`
+- Text blocks: `id="text-1"`, `id="text-2"`
+
+### 2. Inline Styles for Visual Properties
+Colors, border-radius, spacing, fonts **MUST use inline style**:
+
+```html
+<!-- ✅ Correct -->
+<div id="card-1" style="background-color: #f0fdf4; border-radius: 12px; padding: 20px; color: #1f2937;">
+
+<!-- ❌ Wrong -->
+<div class="bg-green-50 rounded-xl p-5 text-gray-800">
+```
+
+### 3. Tailwind for Layout Only
+Layout classes are allowed: `flex`, `grid`, `gap-*`, `items-center`, `w-full`, `h-full`, `absolute`, `relative`
+
+### 4. Common Color Reference
+| Color | Hex | Color | Hex |
+|-------|-----|-------|-----|
+| gray-800 | #1f2937 | blue-500 | #3b82f6 |
+| gray-600 | #4b5563 | green-50 | #f0fdf4 |
+| gray-50 | #f9fafb | purple-50 | #faf5ff |
+| white | #ffffff | amber-50 | #fffbeb |
+
+**Key Principle:** Tailwind classes affect ALL elements using that class; inline styles affect ONLY that specific element.
+
+---
+
 ## Anti-Patterns (FORBIDDEN)
 
 - ❌ `<html>`, `<head>`, `<body>` tags
@@ -198,7 +234,7 @@ The aim is not just to present data and information, but to make the experience 
    - Categories and groupings
    - Key insights or takeaways
 3. **Design** the optimal layout and visual approach based on content
-4. **Output** complete HTML content using `write_to_file` tool
+4. **Output** the complete HTML file using `write_file` tool (replacing the placeholder content)
 
 ---
 
