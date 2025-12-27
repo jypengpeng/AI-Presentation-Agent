@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from agent_core import Agent, SlideRefiner, ToolCallInfo
 from task_manager import TaskManager, Task
 from typing import Optional, List, Tuple
-from directory_picker import pick_directory, is_valid_directory
+from directory_picker import pick_directory, pick_files_or_directory, is_valid_directory, PickResult
 from workspace_copier import WorkspaceCopier, ScanResult
 from slide_generator import SlideGenerator, get_slide_status_summary, parse_presentation_plan
 
@@ -269,9 +269,12 @@ def init_session_state():
     if "editing_task_name" not in st.session_state:
         st.session_state.editing_task_name = False
     
-    # Directory picker state
+    # Directory/file picker state
     if "pending_source_dir" not in st.session_state:
         st.session_state.pending_source_dir = None
+    
+    if "pending_pick_result" not in st.session_state:
+        st.session_state.pending_pick_result = None  # PickResult object
     
     if "pending_scan_result" not in st.session_state:
         st.session_state.pending_scan_result = None
@@ -801,16 +804,24 @@ def get_directory_preview(directory: str, max_items: int = 20) -> Tuple[List[str
 
 
 def handle_directory_selection():
-    """Handle the directory selection and copy process."""
-    # Open directory picker
-    selected_dir = pick_directory("选择工作目录")
+    """Handle the directory/file selection and copy process."""
+    # Open file/directory picker
+    pick_result = pick_files_or_directory("选择工作目录或文件")
     
-    if selected_dir and is_valid_directory(selected_dir):
-        st.session_state.pending_source_dir = selected_dir
+    if pick_result:
+        st.session_state.pending_pick_result = pick_result
+        st.session_state.pending_source_dir = pick_result.base_dir
         
-        # Scan the directory
+        # Scan based on selection type
         copier = WorkspaceCopier()
-        scan_result = copier.scan_directory(selected_dir)
+        
+        if pick_result.is_files:
+            # User selected specific files
+            scan_result = copier.scan_files(pick_result.files, pick_result.base_dir)
+        else:
+            # User selected a directory
+            scan_result = copier.scan_directory(pick_result.base_dir)
+        
         st.session_state.pending_scan_result = scan_result
         
         # Check if size warning is needed
@@ -819,12 +830,14 @@ def handle_directory_selection():
         # Don't auto-proceed, let user confirm after seeing the file list
     else:
         st.session_state.pending_source_dir = None
+        st.session_state.pending_pick_result = None
         st.session_state.pending_scan_result = None
 
 
 def create_task_with_copy():
     """Create a new task and copy the workspace."""
     source_dir = st.session_state.pending_source_dir
+    pick_result = st.session_state.pending_pick_result
     
     if not source_dir:
         return
@@ -839,7 +852,13 @@ def create_task_with_copy():
     
     try:
         copier = WorkspaceCopier()
-        result = copier.copy_directory(source_dir, task.workspace_dir)
+        
+        if pick_result and pick_result.is_files:
+            # Copy only selected files
+            result = copier.copy_files(pick_result.files, pick_result.base_dir, task.workspace_dir)
+        else:
+            # Copy entire directory
+            result = copier.copy_directory(source_dir, task.workspace_dir)
         
         if result.success:
             st.success(f"✅ 已复制 {result.files_copied} 个文件 ({result.total_size_mb:.1f} MB)")
@@ -851,6 +870,7 @@ def create_task_with_copy():
     finally:
         st.session_state.copy_in_progress = False
         st.session_state.pending_source_dir = None
+        st.session_state.pending_pick_result = None
         st.session_state.pending_scan_result = None
         st.session_state.show_size_warning = False
         st.session_state.show_new_task_dialog = False
@@ -890,10 +910,17 @@ def render_task_list():
                         st.session_state.show_new_task_dialog = False
                         st.rerun()
             
-            # Directory selected - show preview and confirm
+            # Directory/files selected - show preview and confirm
             else:
                 source_dir = st.session_state.pending_source_dir
-                st.info(f"📁 已选择: {source_dir}")
+                pick_result = st.session_state.pending_pick_result
+                
+                if pick_result and pick_result.is_files:
+                    # Show selected files info
+                    st.info(f"📄 已选择 {len(pick_result.files)} 个文件")
+                    st.caption(f"📁 来自: {pick_result.base_dir}")
+                else:
+                    st.info(f"📁 已选择目录: {source_dir}")
                 
                 # Show scan statistics
                 scan_result = st.session_state.pending_scan_result
@@ -907,30 +934,40 @@ def render_task_list():
                 # Size warning
                 if st.session_state.show_size_warning:
                     st.warning(
-                        f"⚠️ 目录较大 ({scan_result.total_size_mb:.1f} MB)，"
+                        f"⚠️ 选择的内容较大 ({scan_result.total_size_mb:.1f} MB)，"
                         f"复制可能需要一些时间。"
                     )
                 
-                # Show directory contents preview
-                st.markdown("**📂 目录内容预览:**")
-                files, dirs, total_files, total_dirs = get_directory_preview(source_dir)
-                
-                # Display directories first
-                if dirs:
-                    dir_list = "  \n".join([f"📁 {d}/" for d in dirs[:10]])
-                    if total_dirs > 10:
-                        dir_list += f"  \n... 还有 {total_dirs - 10} 个目录"
-                    st.markdown(dir_list)
-                
-                # Display files
-                if files:
-                    file_list = "  \n".join([f"📄 {f}" for f in files[:10]])
-                    if total_files > 10:
-                        file_list += f"  \n... 还有 {total_files - 10} 个文件"
+                # Show content preview
+                if pick_result and pick_result.is_files:
+                    # Show selected files list
+                    st.markdown("**📄 已选择的文件:**")
+                    relative_files = pick_result.relative_files
+                    file_list = "  \n".join([f"📄 {f}" for f in relative_files[:15]])
+                    if len(relative_files) > 15:
+                        file_list += f"  \n... 还有 {len(relative_files) - 15} 个文件"
                     st.markdown(file_list)
-                
-                if not dirs and not files:
-                    st.caption("(空目录)")
+                else:
+                    # Show directory contents preview
+                    st.markdown("**📂 目录内容预览:**")
+                    files, dirs, total_files, total_dirs = get_directory_preview(source_dir)
+                    
+                    # Display directories first
+                    if dirs:
+                        dir_list = "  \n".join([f"📁 {d}/" for d in dirs[:10]])
+                        if total_dirs > 10:
+                            dir_list += f"  \n... 还有 {total_dirs - 10} 个目录"
+                        st.markdown(dir_list)
+                    
+                    # Display files
+                    if files:
+                        file_list = "  \n".join([f"📄 {f}" for f in files[:10]])
+                        if total_files > 10:
+                            file_list += f"  \n... 还有 {total_files - 10} 个文件"
+                        st.markdown(file_list)
+                    
+                    if not dirs and not files:
+                        st.caption("(空目录)")
                 
                 st.divider()
                 
@@ -943,6 +980,7 @@ def render_task_list():
                 with col2:
                     if st.button("🔄 重新选择", use_container_width=True):
                         st.session_state.pending_source_dir = None
+                        st.session_state.pending_pick_result = None
                         st.session_state.pending_scan_result = None
                         st.session_state.show_size_warning = False
                         handle_directory_selection()
@@ -950,6 +988,7 @@ def render_task_list():
                 with col3:
                     if st.button("❌ 取消", use_container_width=True):
                         st.session_state.pending_source_dir = None
+                        st.session_state.pending_pick_result = None
                         st.session_state.pending_scan_result = None
                         st.session_state.show_size_warning = False
                         st.session_state.show_new_task_dialog = False

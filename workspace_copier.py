@@ -31,12 +31,14 @@ class CopyResult:
 
 @dataclass
 class ScanResult:
-    """Result of scanning a directory."""
+    """Result of scanning a directory or file list."""
     total_files: int = 0
     total_dirs: int = 0
     total_size_bytes: int = 0
     skipped_by_ignore: int = 0
     files_to_copy: List[str] = field(default_factory=list)
+    # Base directory for relative paths
+    base_dir: str = ""
     
     @property
     def total_size_mb(self) -> float:
@@ -195,6 +197,60 @@ class WorkspaceCopier:
         self.parser = GitIgnoreParser(gitignore_path)
         self.size_warning_bytes = int(size_warning_mb * 1024 * 1024)
     
+    def scan_files(
+        self,
+        file_paths: List[str],
+        base_dir: str,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> ScanResult:
+        """
+        Scan a list of specific files and calculate what would be copied.
+        
+        Args:
+            file_paths: List of absolute file paths to scan
+            base_dir: Base directory for calculating relative paths
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            ScanResult with details about files to copy
+        """
+        result = ScanResult()
+        result.base_dir = base_dir
+        base_path = Path(base_dir).resolve()
+        
+        for file_path in file_paths:
+            abs_path = Path(file_path).resolve()
+            
+            if not abs_path.is_file():
+                result.skipped_by_ignore += 1
+                continue
+            
+            # Calculate relative path from base directory
+            try:
+                rel_path = str(abs_path.relative_to(base_path))
+            except ValueError:
+                # File is not under base_dir, use just the filename
+                rel_path = abs_path.name
+            
+            # Check if file should be ignored
+            if self.parser.should_ignore(rel_path, is_dir=False):
+                result.skipped_by_ignore += 1
+                continue
+            
+            try:
+                file_size = os.path.getsize(abs_path)
+                result.total_size_bytes += file_size
+                result.total_files += 1
+                result.files_to_copy.append(rel_path)
+                
+                if progress_callback:
+                    progress_callback(f"Scanning: {rel_path}")
+                    
+            except OSError:
+                result.skipped_by_ignore += 1
+        
+        return result
+    
     def scan_directory(
         self,
         source_dir: str,
@@ -212,6 +268,7 @@ class WorkspaceCopier:
         """
         result = ScanResult()
         source_path = Path(source_dir).resolve()
+        result.base_dir = str(source_path)
         
         if not source_path.is_dir():
             return result
@@ -256,6 +313,68 @@ class WorkspaceCopier:
                 except OSError:
                     # Skip files we can't access
                     result.skipped_by_ignore += 1
+        
+        return result
+    
+    def copy_files(
+        self,
+        file_paths: List[str],
+        base_dir: str,
+        target_dir: str,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None
+    ) -> CopyResult:
+        """
+        Copy a list of specific files to the target location.
+        
+        Args:
+            file_paths: List of absolute file paths to copy
+            base_dir: Base directory for calculating relative paths
+            target_dir: The target directory (will be created if needed)
+            progress_callback: Optional callback(current_file, current_count, total_count)
+            
+        Returns:
+            CopyResult with details about the copy operation
+        """
+        result = CopyResult(success=False)
+        
+        base_path = Path(base_dir).resolve()
+        target_path = Path(target_dir).resolve()
+        
+        try:
+            # First, scan to get the list of files
+            scan_result = self.scan_files(file_paths, base_dir)
+            total_files = scan_result.total_files
+            
+            # Create target directory
+            target_path.mkdir(parents=True, exist_ok=True)
+            result.dirs_created = 1
+            
+            # Copy files
+            for idx, rel_path in enumerate(scan_result.files_to_copy):
+                src_file = base_path / rel_path
+                dst_file = target_path / rel_path
+                
+                # Create parent directories
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Copy file
+                try:
+                    shutil.copy2(src_file, dst_file)
+                    result.files_copied += 1
+                    result.total_size_bytes += os.path.getsize(src_file)
+                    
+                    if progress_callback:
+                        progress_callback(rel_path, idx + 1, total_files)
+                        
+                except Exception as e:
+                    print(f"Warning: Could not copy {rel_path}: {e}")
+                    result.skipped_files += 1
+            
+            result.success = True
+            
+        except Exception as e:
+            result.error = str(e)
+            result.success = False
         
         return result
     
