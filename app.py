@@ -15,6 +15,7 @@ import shutil
 import time
 import asyncio
 import threading
+from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -595,6 +596,800 @@ def prepare_html_for_preview(html_content: str, container_height: int = 600) -> 
         html_content = iframe_fix_css + html_content
     
     return html_content
+
+
+def apply_layout_changes_to_html(slide_id: str, selector: str, layout: dict, html_content: str) -> str:
+    x = float(layout.get('x', 0) or 0)
+    y = float(layout.get('y', 0) or 0)
+    width = layout.get('width')
+    height = layout.get('height')
+
+    style_parts = [f"transform: translate({x}px, {y}px)"]
+    if width is not None:
+        try:
+            style_parts.append(f"width: {float(width)}px")
+        except Exception:
+            pass
+    if height is not None:
+        try:
+            style_parts.append(f"height: {float(height)}px")
+        except Exception:
+            pass
+
+    style_str = '; '.join(style_parts)
+    style_id = f"streamlit_layout_{slide_id}_{abs(hash(selector)) % 100000}"
+    existing_style_pattern = rf'<style[^>]*id=["\']{style_id}["\'][^>]*>'
+    style_tag = f'<style id="{style_id}">{selector} {{{style_str} !important; transform-origin: top left !important;}}</style>'
+
+    if re.search(existing_style_pattern, html_content):
+        html_content = re.sub(
+            rf'<style[^>]*id=["\']{style_id}["\'][^>]*>.*?</style>',
+            style_tag,
+            html_content,
+            flags=re.DOTALL
+        )
+    else:
+        if '</head>' in html_content:
+            html_content = html_content.replace('</head>', style_tag + '</head>')
+        elif '</body>' in html_content:
+            html_content = html_content.replace('</body>', style_tag + '</body>')
+        else:
+            html_content = style_tag + html_content
+
+    return html_content
+
+
+def inject_editing_support(html_content: str, slide_id: str, selected_selector: Optional[str] = None, enabled: bool = True) -> str:
+    """在 HTML 中注入编辑支持，包括元素选择和锁定功能"""
+    from datetime import datetime
+    
+    # 检查是否需要 Chart.js（如果内容中有图表）
+    needs_chart_js = 'canvas' in html_content.lower() and ('chart' in html_content.lower() or 'Chart(' in html_content or 'new Chart' in html_content)
+    chart_js_loaded = 'cdn.jsdelivr.net/npm/chart.js' in html_content or 'chart.js' in html_content.lower()
+    
+    # 如果需要 Chart.js 但还没有加载，添加它（必须在图表初始化脚本之前）
+    if needs_chart_js and not chart_js_loaded:
+        # 使用正确的 Chart.js CDN 链接，避免 source map 404 错误
+        chart_js_script = '<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>'
+        # 查找第一个 <script> 标签，在它之前插入 Chart.js
+        script_match = re.search(r'<script', html_content)
+        if script_match:
+            insert_pos = script_match.start()
+            html_content = html_content[:insert_pos] + chart_js_script + html_content[insert_pos:]
+        else:
+            html_content = chart_js_script + html_content
+    
+    editing_script = f"""
+    <!-- Interact.js 库 - 用于拖拽和调整大小 -->
+    <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
+    
+    <style>
+        .editable-element {{
+            cursor: {'move' if enabled else 'default'} !important;
+            transition: all 0.2s ease;
+            border: 2px solid transparent;
+            padding: 2px;
+            margin: -2px;
+            position: relative !important;
+            user-select: none;
+        }}
+        .editable-element.resizing {{
+            cursor: nwse-resize !important;
+        }}
+        .editable-element:hover {{
+            border-color: #2196f3 !important;
+            background-color: rgba(33, 150, 243, 0.1) !important;
+        }}
+        .editable-element.dragging {{
+            opacity: 0.5;
+            z-index: 1000;
+        }}
+    </style>
+    <script>
+    (function() {{
+        const slideId = '{slide_id}';
+        const layoutEnabled = {str(bool(enabled)).lower()};
+
+        function disableAllInteractions() {{
+            try {{
+                if (typeof interact === 'undefined') return;
+                document.querySelectorAll('.editable-element').forEach((el) => {{
+                    try {{
+                        interact(el).unset();
+                    }} catch(e) {{
+                        // ignore
+                    }}
+                }});
+            }} catch(e) {{
+                // ignore
+            }}
+        }}
+
+        function emitLayout(target, selector) {{
+            try {{
+                console.log('[LAYOUT] emitLayout called:', {{ selector: selector, target: target.tagName }});
+                const x = parseFloat(target.getAttribute('data-x')) || 0;
+                const y = parseFloat(target.getAttribute('data-y')) || 0;
+                const rect = target.getBoundingClientRect();
+                const payload = {{
+                    slide_id: slideId,
+                    selector: selector,
+                    x: x,
+                    y: y,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    ts: Date.now()
+                }};
+                console.log('[LAYOUT] Payload created:', payload);
+
+                let sentToTop = false;
+                let sentToParent = false;
+                
+                try {{
+                    if (window.top && window.top !== window) {{
+                        window.top.postMessage({{ type: 'layout_changed', data: payload }}, '*');
+                        sentToTop = true;
+                        console.log('[LAYOUT] ✅ Sent to window.top');
+                    }}
+                }} catch(e) {{
+                    console.error('[LAYOUT] ❌ Failed to send to window.top:', e);
+                }}
+
+                try {{
+                    if (window.parent && window.parent !== window) {{
+                        window.parent.postMessage({{ type: 'layout_changed', data: payload }}, '*');
+                        sentToParent = true;
+                        console.log('[LAYOUT] ✅ Sent to window.parent');
+                    }}
+                }} catch(e) {{
+                    console.error('[LAYOUT] ❌ Failed to send to window.parent:', e);
+                }}
+                
+                if (!sentToTop && !sentToParent) {{
+                    console.warn('[LAYOUT] ⚠️ Message not sent! window.top === window:', window.top === window, 'window.parent === window:', window.parent === window);
+                }}
+            }} catch(e) {{
+                console.error('[LAYOUT] ❌ Error in emitLayout:', e);
+            }}
+        }}
+        
+        function generateSelector(element) {{
+            if (element.id) {{
+                return '#' + element.id;
+            }}
+            
+            function getPath(el) {{
+                const path = [];
+                while (el && el.nodeType === 1) {{
+                    let selector = el.tagName.toLowerCase();
+                    
+                    if (el.className && typeof el.className === 'string') {{
+                        const classes = el.className.split(' ').filter(c => c && c !== 'editable-element' && c !== 'selected');
+                        if (classes.length > 0) {{
+                            selector += '.' + classes.join('.');
+                        }}
+                    }}
+                    
+                    const siblings = Array.from(el.parentElement ? el.parentElement.children : []);
+                    const sameTagSiblings = siblings.filter(s => s.tagName === el.tagName);
+                    const index = sameTagSiblings.indexOf(el);
+                    
+                    if (sameTagSiblings.length > 1) {{
+                        selector += ':nth-of-type(' + (index + 1) + ')';
+                    }}
+                    
+                    path.unshift(selector);
+                    el = el.parentElement;
+                    
+                    if (path.length >= 5) break;
+                }}
+                return path.join(' > ');
+            }}
+            
+            if (element.className && typeof element.className === 'string') {{
+                const classes = element.className.split(' ').filter(c => c && c !== 'editable-element' && c !== 'selected');
+                if (classes.length > 0) {{
+                    const tagName = element.tagName.toLowerCase();
+                    const siblings = Array.from(element.parentElement ? element.parentElement.children : []);
+                    const sameTagSiblings = siblings.filter(s => s.tagName === element.tagName);
+                    const index = sameTagSiblings.indexOf(element);
+                    if (sameTagSiblings.length > 1) {{
+                        return tagName + '.' + classes[0] + ':nth-of-type(' + (index + 1) + ')';
+                    }} else {{
+                        return tagName + '.' + classes[0];
+                    }}
+                }}
+            }}
+            
+            const pathSelector = getPath(element);
+            if (pathSelector) {{
+                return pathSelector;
+            }}
+            
+            const tagName = element.tagName.toLowerCase();
+            const siblings = Array.from(element.parentElement ? element.parentElement.children : []);
+            const sameTagSiblings = siblings.filter(s => s.tagName === element.tagName);
+            const index = sameTagSiblings.indexOf(element);
+            return tagName + ':nth-of-type(' + (index + 1) + ')';
+        }}
+        
+        function makeEditable(element) {{
+            if (element.classList.contains('editable-element')) return;
+            
+            element.classList.add('editable-element');
+            const selector = generateSelector(element);
+            element.setAttribute('data-selector', selector);
+            
+            if (!element.id && !element.getAttribute('data-element-id')) {{
+                const elementId = 'elem_' + slideId + '_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                element.setAttribute('data-element-id', elementId);
+            }}
+            
+            // 添加点击选择功能
+            element.addEventListener('click', function(e) {{
+                // 如果正在编辑文字，不触发选择
+                if (element.contentEditable === 'true') {{
+                    return;
+                }}
+                e.stopPropagation();
+                e.preventDefault();
+                const elementId = element.id || element.getAttribute('data-element-id') || null;
+                const tag = element.tagName.toLowerCase();
+                const text = element.textContent || element.innerText || '';
+                const styles = window.getComputedStyle(element);
+                
+                const selectedData = {{
+                    slide_id: slideId,
+                    selector: selector,
+                    element_id: elementId,
+                    tag: tag,
+                    text: text.substring(0, 100),
+                    styles: {{
+                        fontFamily: styles.fontFamily,
+                        fontSize: styles.fontSize,
+                        color: styles.color,
+                        backgroundColor: styles.backgroundColor,
+                        fontWeight: styles.fontWeight,
+                        textAlign: styles.textAlign
+                    }}
+                }};
+                
+                console.log('[EDIT] Element clicked:', selectedData);
+                
+                // 使用 postMessage 与父窗口通信（iframe 无法直接修改父窗口 URL）
+                try {{
+                    const message = {{
+                        type: 'element_selected',
+                        data: selectedData
+                    }};
+                    
+                    if (window.top && window.top !== window) {{
+                        window.top.postMessage(message, '*');
+                        console.log('[EDIT] Sent message to window.top');
+                    }} else if (window.parent && window.parent !== window) {{
+                        window.parent.postMessage(message, '*');
+                        console.log('[EDIT] Sent message to window.parent');
+                    }} else {{
+                        // 如果不在 iframe 中，直接设置 URL
+                        const url = new URL(window.location.href);
+                        url.searchParams.set('selected', JSON.stringify(selectedData));
+                        url.searchParams.set('_t', Date.now().toString());
+                        window.location.href = url.toString();
+                    }}
+                }} catch(e) {{
+                    console.error('[EDIT] Failed to send message:', e);
+                }}
+            }}, true);
+            
+            // 添加双击编辑文字功能（仅在布局调整模式下）
+            if (layoutEnabled) {{
+                let doubleClickTimer = null;
+                element.addEventListener('dblclick', function(e) {{
+                    e.stopPropagation();
+                    e.preventDefault();
+                    
+                    // 只允许文本元素编辑
+                    const tag = element.tagName.toLowerCase();
+                    const textElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'div', 'li', 'td', 'th', 'a', 'button', 'label'];
+                    if (!textElements.includes(tag)) {{
+                        return;
+                    }}
+                    
+                    // 使元素可编辑
+                    element.contentEditable = 'true';
+                    element.style.outline = '2px solid #2196f3';
+                    element.style.outlineOffset = '2px';
+                    element.style.backgroundColor = 'rgba(33, 150, 243, 0.1)';
+                    
+                    // 聚焦并选中所有文字
+                    element.focus();
+                    if (window.getSelection) {{
+                        const selection = window.getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(element);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                    }}
+                    
+                    console.log('[EDIT] Element made editable:', selector);
+                    
+                    // 监听失去焦点事件，保存更改
+                    function saveTextChange() {{
+                        if (element.contentEditable === 'true') {{
+                            const newText = element.textContent || element.innerText || '';
+                            const elementId = element.id || element.getAttribute('data-element-id') || null;
+                            
+                            // 恢复不可编辑状态
+                            element.contentEditable = 'false';
+                            element.style.outline = '';
+                            element.style.outlineOffset = '';
+                            element.style.backgroundColor = '';
+                            
+                            // 发送文字更新消息
+                            try {{
+                                const message = {{
+                                    type: 'text_changed',
+                                    data: {{
+                                        slide_id: slideId,
+                                        selector: selector,
+                                        element_id: elementId,
+                                        new_text: newText
+                                    }}
+                                }};
+                                
+                                if (window.top && window.top !== window) {{
+                                    window.top.postMessage(message, '*');
+                                }} else if (window.parent && window.parent !== window) {{
+                                    window.parent.postMessage(message, '*');
+                                }}
+                                console.log('[EDIT] Text changed, sent message:', newText.substring(0, 50));
+                            }} catch(e) {{
+                                console.error('[EDIT] Failed to send text change message:', e);
+                            }}
+                            
+                            element.removeEventListener('blur', saveTextChange);
+                            element.removeEventListener('keydown', handleKeyDown);
+                        }}
+                    }}
+                    
+                    // 处理回车键和ESC键
+                    function handleKeyDown(e) {{
+                        if (e.key === 'Enter' && !e.shiftKey) {{
+                            e.preventDefault();
+                            element.blur();
+                        }} else if (e.key === 'Escape') {{
+                            e.preventDefault();
+                            element.textContent = element.getAttribute('data-original-text') || element.textContent;
+                            element.blur();
+                        }}
+                    }}
+                    
+                    // 保存原始文字
+                    element.setAttribute('data-original-text', element.textContent);
+                    
+                    // 添加事件监听器
+                    element.addEventListener('blur', saveTextChange, {{ once: true }});
+                    element.addEventListener('keydown', handleKeyDown);
+                }});
+            }}
+            
+            // 设置拖动和拉伸功能（等待 Interact.js 加载）
+            function setupInteractForElement() {{
+                console.log('[LAYOUT] setupInteractForElement called, layoutEnabled:', layoutEnabled, 'interact defined:', typeof interact !== 'undefined');
+                if (!layoutEnabled) {{
+                    console.log('[LAYOUT] ⚠️ layoutEnabled is false, skipping interact setup');
+                    return; // 如果 layoutEnabled 为 false，不设置交互
+                }}
+                
+                if (typeof interact !== 'undefined') {{
+                    // Interact.js 已加载，立即设置
+                    console.log('[LAYOUT] ✅ Setting up interact for element:', selector);
+                    try {{
+                        interact(element)
+                            .draggable({{
+                                allowFrom: null,
+                                ignoreFrom: '.resize-handle',
+                                onstart: function(event) {{
+                                    console.log('[LAYOUT] 🎯 Drag started');
+                                    event.target.classList.add('dragging');
+                                }},
+                                onmove: function(event) {{
+                                    const target = event.target;
+                                    const x = (parseFloat(target.getAttribute('data-x')) || 0) + event.dx;
+                                    const y = (parseFloat(target.getAttribute('data-y')) || 0) + event.dy;
+                                    target.style.transform = `translate(${{x}}px, ${{y}}px)`;
+                                    target.setAttribute('data-x', x);
+                                    target.setAttribute('data-y', y);
+                                }},
+                                onend: function(event) {{
+                                    console.log('[LAYOUT] 🎯 Drag ended, calling emitLayout');
+                                    event.target.classList.remove('dragging');
+                                    emitLayout(event.target, selector);
+                                }}
+                            }})
+                            .resizable({{
+                                edges: {{ left: true, right: true, top: true, bottom: true }},
+                                margin: 8,
+                                listeners: {{
+                                    start: function(event) {{
+                                        event.target.classList.add('resizing');
+                                    }},
+                                    move: function(event) {{
+                                        const target = event.target;
+                                        let x = (parseFloat(target.getAttribute('data-x')) || 0);
+                                        let y = (parseFloat(target.getAttribute('data-y')) || 0);
+                                        target.style.width = event.rect.width + 'px';
+                                        target.style.height = event.rect.height + 'px';
+                                        x += event.deltaRect.left;
+                                        y += event.deltaRect.top;
+                                        target.style.transform = `translate(${{x}}px, ${{y}}px)`;
+                                        target.setAttribute('data-x', x);
+                                        target.setAttribute('data-y', y);
+                                    }},
+                                    end: function(event) {{
+                                        console.log('[LAYOUT] 🎯 Resize ended, calling emitLayout');
+                                        event.target.classList.remove('resizing');
+                                        emitLayout(event.target, selector);
+                                    }}
+                                }},
+                                modifiers: [
+                                    interact.modifiers.restrictSize({{
+                                        min: {{ width: 50, height: 20 }}
+                                    }})
+                                ]
+                            }});
+                        console.log('[EDIT] Interact.js setup for element:', selector);
+                    }} catch(e) {{
+                        console.error('[EDIT] Failed to setup interact:', e);
+                    }}
+                }} else {{
+                    // Interact.js 还没加载，等待一下再试
+                    setTimeout(setupInteractForElement, 50);
+                }}
+            }}
+            
+            // 立即尝试设置（如果 layoutEnabled 为 true）
+            if (layoutEnabled) {{
+                setupInteractForElement();
+            }}
+        }}
+        
+        function init() {{
+            // 如果页面需要 Chart.js，等待它加载完成
+            const needsChart = document.querySelector('canvas') && (document.querySelector('script[src*="chart"]') || document.body.innerHTML.includes('Chart(') || document.body.innerHTML.includes('new Chart'));
+            if (needsChart && typeof Chart === 'undefined') {{
+                // 等待 Chart.js 加载
+                let attempts = 0;
+                const checkChart = setInterval(function() {{
+                    attempts++;
+                    if (typeof Chart !== 'undefined' || attempts > 50) {{
+                        clearInterval(checkChart);
+                        if (attempts > 50) {{
+                            console.warn('Chart.js not loaded after timeout');
+                        }}
+                        doInit();
+                    }}
+                }}, 100);
+                return;
+            }}
+            
+            doInit();
+        }}
+        
+        function doInit() {{
+            console.log('[EDIT] doInit called, layoutEnabled=' + layoutEnabled);
+            console.log('[EDIT] interact available:', typeof interact !== 'undefined');
+            
+            const selectors = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'span', 'button', 'a', 'strong', 'em', 'small', 'li', 'ul', 'ol', 'img', 'svg', 'canvas'];
+            let elementCount = 0;
+            selectors.forEach(selector => {{
+                document.querySelectorAll(selector).forEach(el => {{
+                    if (el.closest('script') || el.closest('style') || el.closest('head')) return;
+                    makeEditable(el);
+                    elementCount++;
+                }});
+            }});
+            console.log('[EDIT] Made ' + elementCount + ' elements editable');
+
+            if (!layoutEnabled) {{
+                console.log('[EDIT] layoutEnabled=false, disabling interactions');
+                (function tryDisable(attempt) {{
+                    try {{
+                        if (typeof interact === 'undefined') {{
+                            if (attempt < 20) setTimeout(() => tryDisable(attempt + 1), 50);
+                            return;
+                        }}
+                        disableAllInteractions();
+                        console.log('[EDIT] Interactions disabled');
+                    }} catch(e) {{
+                        console.error('[EDIT] Error disabling interactions:', e);
+                    }}
+                }})(0);
+            }} else {{
+                console.log('[EDIT] layoutEnabled=true, interactions should be enabled');
+            }}
+        }}
+        
+        // 延迟初始化，确保 Chart.js 和其他脚本先加载
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', function() {{
+                setTimeout(init, 100);
+            }});
+        }} else {{
+            setTimeout(init, 100);
+        }}
+    }})();
+    </script>
+    """
+    
+    if '</body>' in html_content:
+        html_content = html_content.replace('</body>', editing_script + '</body>')
+    else:
+        html_content += editing_script
+    
+    return html_content
+
+
+def apply_text_changes_to_html(slide_id: str, selector: str, new_text: str, html_content: str, element_id: str = None) -> str:
+    """应用文字更改到 HTML 内容"""
+    import html as html_module
+    
+    # 转义HTML特殊字符
+    escaped_text = html_module.escape(new_text)
+    
+    if element_id:
+        # 使用 element_id 查找元素（优先）
+        element_id_pattern = rf'data-element-id=["\']{re.escape(element_id)}["\']'
+        
+        # 查找包含该 element_id 的开始标签
+        start_tag_pattern = rf'<([^>]*{re.escape(element_id_pattern)}[^>]*)>'
+        match = re.search(start_tag_pattern, html_content)
+        
+        if match:
+            start_pos = match.start()
+            start_tag = match.group(0)
+            # 提取标签名
+            tag_name_match = re.search(r'<(\w+)', start_tag)
+            if tag_name_match:
+                tag_name = tag_name_match.group(1)
+                
+                # 找到对应的结束标签
+                # 从开始标签后开始查找
+                search_start = match.end()
+                depth = 1
+                pos = search_start
+                end_pos = -1
+                
+                while pos < len(html_content) and depth > 0:
+                    # 查找下一个标签
+                    next_open = html_content.find(f'<{tag_name}', pos)
+                    next_close = html_content.find(f'</{tag_name}>', pos)
+                    
+                    if next_close == -1:
+                        break
+                    
+                    if next_open != -1 and next_open < next_close:
+                        # 找到嵌套的开始标签
+                        depth += 1
+                        pos = next_open + len(tag_name) + 1
+                    else:
+                        # 找到结束标签
+                        depth -= 1
+                        if depth == 0:
+                            end_pos = next_close
+                            break
+                        pos = next_close + len(f'</{tag_name}>')
+                
+                if end_pos != -1:
+                    # 替换标签内容
+                    html_content = html_content[:match.end()] + escaped_text + html_content[end_pos:]
+                    print(f"[TEXT] ✅ 使用 element_id 替换成功: {element_id}")
+                    return html_content
+    
+    # 使用 selector 查找元素
+    selector_pattern = rf'data-selector=["\']{re.escape(selector)}["\']'
+    match = re.search(rf'<([^>]*{re.escape(selector_pattern)}[^>]*)>', html_content)
+    
+    if match:
+        start_pos = match.start()
+        start_tag = match.group(0)
+        tag_name_match = re.search(r'<(\w+)', start_tag)
+        if tag_name_match:
+            tag_name = tag_name_match.group(1)
+            
+            # 找到对应的结束标签
+            search_start = match.end()
+            depth = 1
+            pos = search_start
+            end_pos = -1
+            
+            while pos < len(html_content) and depth > 0:
+                next_open = html_content.find(f'<{tag_name}', pos)
+                next_close = html_content.find(f'</{tag_name}>', pos)
+                
+                if next_close == -1:
+                    break
+                
+                if next_open != -1 and next_open < next_close:
+                    depth += 1
+                    pos = next_open + len(tag_name) + 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = next_close
+                        break
+                    pos = next_close + len(f'</{tag_name}>')
+            
+            if end_pos != -1:
+                html_content = html_content[:match.end()] + escaped_text + html_content[end_pos:]
+                print(f"[TEXT] ✅ 使用 selector 替换成功: {selector}")
+                return html_content
+    
+    print(f"[TEXT] ⚠️ 未找到匹配的元素，element_id={element_id}, selector={selector}")
+    return html_content
+
+
+def apply_element_style_changes_to_html(slide_id: str, selector: str, style_props: dict, html_content: str) -> str:
+    style_parts = []
+    if 'font_family' in style_props:
+        style_parts.append(f"font-family: {style_props['font_family']}")
+    if 'font_size' in style_props:
+        style_parts.append(f"font-size: {style_props['font_size']}px")
+    if 'color' in style_props:
+        style_parts.append(f"color: {style_props['color']}")
+    if 'background_color' in style_props:
+        style_parts.append(f"background-color: {style_props['background_color']}")
+    if 'pos_x' in style_props and 'pos_y' in style_props:
+        style_parts.append("position: relative")
+        style_parts.append(f"left: {style_props['pos_x']}%")
+        style_parts.append(f"top: {style_props['pos_y']}%")
+    if 'font_weight' in style_props:
+        style_parts.append(f"font-weight: {style_props['font_weight']}")
+    if 'text_align' in style_props:
+        style_parts.append(f"text-align: {style_props['text_align']}")
+
+    style_str = '; '.join(style_parts)
+    element_id = style_props.get('element_id')
+    final_selector = selector
+
+    if element_id:
+        element_id_pattern = rf'data-element-id=["\']{re.escape(element_id)}["\']'
+        if re.search(element_id_pattern, html_content):
+            def add_style_to_element_by_id(match):
+                full_match = match.group(0)
+                if 'style=' in full_match:
+                    def update_style(m):
+                        existing = m.group(1)
+                        for prop in ['font-family', 'font-size', 'color', 'background-color', 'position', 'left', 'top', 'font-weight', 'text-align']:
+                            existing = re.sub(rf'{prop}:\s*[^;]+;?', '', existing)
+                        existing = existing.strip().rstrip(';').strip()
+                        if existing:
+                            new_style = f'{existing}; {style_str}'
+                        else:
+                            new_style = style_str
+                        return f'style="{new_style}"'
+                    return re.sub(r'style="([^"]*)"', update_style, full_match)
+                return full_match.rstrip('>') + f' style="{style_str}">'
+
+            html_content = re.sub(
+                rf'(<[^>]*{element_id_pattern}[^>]*)',
+                add_style_to_element_by_id,
+                html_content
+            )
+            final_selector = f'[data-element-id="{element_id}"]'
+        else:
+            selector_pattern = rf'data-selector=["\']{re.escape(selector)}["\']'
+            if re.search(selector_pattern, html_content):
+                def add_element_id(match):
+                    tag = match.group(0)
+                    if 'data-element-id=' not in tag:
+                        tag = tag.replace('>', f' data-element-id="{element_id}">')
+                    return tag
+
+                html_content = re.sub(
+                    rf'(<[^>]*{selector_pattern}[^>]*)',
+                    add_element_id,
+                    html_content,
+                    count=1
+                )
+            if re.search(element_id_pattern, html_content):
+                final_selector = f'[data-element-id="{element_id}"]'
+            else:
+                final_selector = selector
+    else:
+        pattern = rf'data-selector=["\']{re.escape(selector)}["\']'
+        if re.search(pattern, html_content):
+            final_selector = f'[data-selector="{selector}"]'
+
+    style_id = f"streamlit_style_{slide_id}_{abs(hash(selector)) % 100000}"
+    existing_style_pattern = rf'<style[^>]*id=["\']{style_id}["\'][^>]*>'
+    style_tag = f'<style id="{style_id}">{final_selector} {{{style_str} !important;}}</style>'
+
+    if re.search(existing_style_pattern, html_content):
+        html_content = re.sub(
+            rf'<style[^>]*id=["\']{style_id}["\'][^>]*>.*?</style>',
+            style_tag,
+            html_content,
+            flags=re.DOTALL
+        )
+    else:
+        if '</head>' in html_content:
+            html_content = html_content.replace('</head>', style_tag + '</head>')
+        elif '</body>' in html_content:
+            html_content = html_content.replace('</body>', style_tag + '</body>')
+        else:
+            html_content = style_tag + html_content
+
+    return html_content
+
+
+def apply_style_realtime(slide_id: str, selector: str, style_props: dict, manifest: dict, slides_dir: Path, element_id: str = None):
+    """实时应用样式更改（不显示消息，静默更新）"""
+    from datetime import datetime
+    
+    print(f"[STYLE] apply_style_realtime called: slide_id={slide_id}, selector={selector}, style_props={style_props}")
+    
+    history_key = f"style_history_{slide_id}_{selector}"
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+
+    draft_key = f"draft_html_{slide_id}"
+    dirty_key = f"draft_dirty_{slide_id}"
+
+    print(f"[STYLE] draft_key={draft_key}, dirty_key={dirty_key}")
+    print(f"[STYLE] draft_key in session_state: {draft_key in st.session_state}")
+
+    # 获取幻灯片文件名
+    slides = manifest.get("slides", [])
+    slide_meta = None
+    for slide in slides:
+        if slide.get("id") == slide_id:
+            slide_meta = slide
+            break
+    
+    if not slide_meta:
+        print(f"[STYLE] ERROR: 未找到幻灯片: {slide_id}")
+        return False
+    
+    slide_file = slides_dir / slide_meta.get("file", f"{slide_id}.html")
+    print(f"[STYLE] slide_file: {slide_file}")
+
+    base_html = None
+    if draft_key in st.session_state and st.session_state.get(draft_key):
+        base_html = st.session_state.get(draft_key)
+        print(f"[STYLE] 从 session_state 获取 base_html，长度: {len(base_html)}")
+    elif slide_file.exists():
+        try:
+            base_html = slide_file.read_text(encoding='utf-8')
+            print(f"[STYLE] 从文件读取 base_html，长度: {len(base_html)}")
+        except Exception as e:
+            print(f"[STYLE] ERROR: 读取文件失败: {e}")
+            base_html = None
+
+    if base_html:
+        history = st.session_state[history_key]
+        history.append(base_html)
+        if len(history) > 10:
+            history.pop(0)
+        st.session_state[history_key] = history
+        print(f"[STYLE] 添加到历史记录，历史记录数量: {len(history)}")
+
+    if element_id:
+        style_props['element_id'] = element_id
+
+    if base_html is None:
+        print(f"[STYLE] ERROR: base_html 为空")
+        return False
+
+    print(f"[STYLE] 应用样式更改...")
+    updated_html = apply_element_style_changes_to_html(slide_id, selector, style_props, base_html)
+    print(f"[STYLE] 样式更改完成，updated_html 长度: {len(updated_html)}")
+    
+    st.session_state[draft_key] = updated_html
+    # 不再设置 dirty_key，因为返回就撤回所有操作
+    print(f"[STYLE] 设置 draft_key")
+    
+    return True
 
 
 def format_tool_args(args: dict) -> str:
@@ -1551,6 +2346,140 @@ def render_expanded_slide_view(task: Task, manifest: dict):
     slide_id = st.session_state.grid_expanded_slide
     if not slide_id:
         return
+
+    draft_key = f"draft_html_{slide_id}"
+    dirty_key = f"draft_dirty_{slide_id}"
+    layout_active_key = f"layout_active_{slide_id}"
+    desc_active_key = f"desc_active_{slide_id}"
+    leave_confirm_key = f"leave_confirm_{slide_id}"
+    leave_target_key = f"leave_target_{slide_id}"
+    toast_key = f"toast_{slide_id}"
+    scroll_target_key = f"scroll_target_{slide_id}"
+    save_pending_key = f"layout_save_pending_{slide_id}"
+    save_requested_ts_key = f"layout_save_requested_ts_{slide_id}"
+    last_layout_ts_key = f"last_layout_ts_{slide_id}"
+    leave_confirm_bridge_key = f"leave_confirm_bridge_{slide_id}"
+    leave_confirm_nonce_key = f"leave_confirm_nonce_{slide_id}"
+    toast_nonce_key = f"toast_nonce_{slide_id}"
+
+    if layout_active_key not in st.session_state:
+        st.session_state[layout_active_key] = False
+    if desc_active_key not in st.session_state:
+        st.session_state[desc_active_key] = False
+    if leave_confirm_key not in st.session_state:
+        st.session_state[leave_confirm_key] = False
+    if toast_key not in st.session_state:
+        st.session_state[toast_key] = ""
+    if scroll_target_key not in st.session_state:
+        st.session_state[scroll_target_key] = None
+    if save_pending_key not in st.session_state:
+        st.session_state[save_pending_key] = False
+    if save_requested_ts_key not in st.session_state:
+        st.session_state[save_requested_ts_key] = 0
+    if last_layout_ts_key not in st.session_state:
+        st.session_state[last_layout_ts_key] = 0
+    if leave_confirm_bridge_key not in st.session_state:
+        st.session_state[leave_confirm_bridge_key] = ""
+    if leave_confirm_nonce_key not in st.session_state:
+        st.session_state[leave_confirm_nonce_key] = 0
+    if toast_nonce_key not in st.session_state:
+        st.session_state[toast_nonce_key] = 0
+
+    if st.session_state.get(toast_key):
+        msg = str(st.session_state.get(toast_key))
+        st.session_state[toast_key] = ""
+        st.session_state[toast_nonce_key] = int(st.session_state.get(toast_nonce_key) or 0) + 1
+        toast_nonce = int(st.session_state.get(toast_nonce_key) or 0)
+        # 使用 st.toast 和 alert 双重提示
+        st.toast(msg, icon="✅")
+        st.markdown(
+            f"""
+<script>
+(function(){{
+  try{{
+    const k = '__pptToastNonce_{slide_id}';
+    const last = window[k] || 0;
+    const cur = {toast_nonce};
+    if (cur > last) {{
+      window[k] = cur;
+      setTimeout(function() {{
+        alert({json.dumps(msg, ensure_ascii=False)});
+      }}, 100);
+    }}
+  }}catch(e){{}}
+}})();
+</script>
+""",
+            unsafe_allow_html=True,
+        )
+
+    # 移除旧的确认对话框桥接逻辑，改用简单的按钮确认
+
+    # 使用 postMessage 处理元素选择
+    st.markdown(
+        """
+<script>
+(function() {
+  try {
+    if (window.__pptLayoutBridgeHandler) {
+      window.removeEventListener('message', window.__pptLayoutBridgeHandler, false);
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  window.__pptLayoutBridgeHandler = function(event) {
+    try {
+      const msg = event && event.data;
+      if (!msg || typeof msg !== 'object') return;
+      
+      // Handle element selection - 直接通过 URL 参数传递
+      if (msg.type === 'element_selected') {
+        const selectedData = msg.data;
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set('selected', JSON.stringify(selectedData));
+          url.searchParams.set('_t', Date.now().toString());
+          window.history.replaceState({}, '', url);
+          // 触发 Streamlit rerun
+          setTimeout(() => {
+            window.location.reload();
+          }, 100);
+        } catch (e) {
+          console.error('Failed to update URL:', e);
+        }
+        return;
+      }
+      
+      // Handle text changes - 通过 URL 参数传递
+      if (msg.type === 'text_changed') {
+        const textData = msg.data;
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set('text_change', JSON.stringify(textData));
+          url.searchParams.set('_t', Date.now().toString());
+          window.history.replaceState({}, '', url);
+          // 触发 Streamlit rerun
+          setTimeout(() => {
+            window.location.reload();
+          }, 100);
+        } catch (e) {
+          console.error('Failed to update URL for text change:', e);
+        }
+        return;
+      }
+      
+    } catch (e) {
+      console.error('Bridge handler error:', e);
+    }
+  };
+
+  window.addEventListener('message', window.__pptLayoutBridgeHandler, false);
+})();
+</script>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Find the slide in manifest
     slides = manifest.get("slides", [])
@@ -1571,16 +2500,35 @@ def render_expanded_slide_view(task: Task, manifest: dict):
     if not slides_dir:
         st.error("未找到幻灯片目录")
         return
+
+    # 移除 save_pending_key 相关逻辑，因为不再需要保存确认
+
+    # 移除旧的确认对话框逻辑，改用简单的按钮确认
     
     # Header with back button
-    col1, col2, col3 = st.columns([1, 3, 1])
-    with col1:
-        if st.button("← 返回网格", use_container_width=True):
+    if st.button("← 返回网格", use_container_width=False, key=f"back_btn_{slide_id}"):
+        if st.session_state.slide_modification_in_progress:
+            st.warning("正在应用修改，请稍后再试。")
+            st.stop()
+        
+        # 直接撤回所有操作
+        if draft_key in st.session_state:
+            del st.session_state[draft_key]
+        if dirty_key in st.session_state:
+            del st.session_state[dirty_key]
+        st.session_state[layout_active_key] = False
+        st.session_state[desc_active_key] = False
+        # 清除选中元素
+        if st.session_state.get("selected_element") and st.session_state.selected_element.get("slide_id") == slide_id:
+            st.session_state.selected_element = None
             st.session_state.grid_expanded_slide = None
             st.rerun()
-    with col2:
+    
+    # Title and page number below the back button
+    col1, col2 = st.columns([3, 1])
+    with col1:
         st.subheader(f"📄 {slide_meta.get('title', 'Slide')}")
-    with col3:
+    with col2:
         st.caption(f"第 {slide_index + 1} / {len(slides)} 页")
     
     st.divider()
@@ -1589,42 +2537,553 @@ def render_expanded_slide_view(task: Task, manifest: dict):
     col_preview, col_edit = st.columns([7, 3])
     
     with col_preview:
-        st.markdown("**预览**")
+        st.markdown("**预览** (点击元素进行选择)")
         slide_file = slide_meta.get("file", "")
         slide_path = slides_dir / slide_file
         
         if slide_path.exists():
             try:
-                slide_content = slide_path.read_text(encoding='utf-8')
-                # Apply iframe fixes for correct preview rendering
-                preview_content = prepare_html_for_preview(slide_content, container_height=500)
-                components.html(preview_content, height=500, scrolling=True)
+                # 如果 draft_key 不存在，从文件读取
+                # 如果存在，优先使用 session_state 中的内容（可能是未导出的修改）
+                if draft_key not in st.session_state:
+                    slide_content = slide_path.read_text(encoding='utf-8')
+                    st.session_state[draft_key] = slide_content
+                    print(f"[LOAD] 从文件加载: {slide_path}, 大小: {len(slide_content)} 字节")
+                else:
+                    slide_content = st.session_state.get(draft_key, "")
+                    print(f"[LOAD] 使用 session_state 内容，大小: {len(slide_content)} 字节")
+                    # 验证 session_state 中的内容是否与文件一致（用于调试）
+                    file_content = slide_path.read_text(encoding='utf-8')
+                    if slide_content != file_content:
+                        print(f"[LOAD] 警告: session_state 内容与文件不一致！")
+                        print(f"[LOAD] session_state 大小: {len(slide_content)} 字节")
+                        print(f"[LOAD] 文件大小: {len(file_content)} 字节")
+                
+                # 重要：检查 URL 参数中是否有文字更改 - 必须在布局变化之前处理
+                text_change_param = st.query_params.get("text_change")
+                if text_change_param:
+                    print(f"[TEXT] 🔍 检测到 URL 参数中的 text_change: {text_change_param[:100]}...")
+                    try:
+                        text_change_data = json.loads(text_change_param)
+                        if isinstance(text_change_data, dict) and text_change_data.get("slide_id") == slide_id:
+                            selector = text_change_data.get("selector")
+                            new_text = text_change_data.get("new_text", "")
+                            element_id = text_change_data.get("element_id")
+                            print(f"[TEXT] 📦 解析后的 text_change_data: slide_id={slide_id}, selector={selector}, element_id={element_id}, new_text长度={len(new_text)}")
+                            if selector and slide_content:
+                                # 应用文字更改到当前内容
+                                print(f"[TEXT] 🔧 准备应用文字更改，当前内容长度: {len(slide_content)}")
+                                updated_html = apply_text_changes_to_html(slide_id, selector, new_text, slide_content, element_id)
+                                print(f"[TEXT] 🔧 文字更改后内容长度: {len(updated_html)}")
+                                st.session_state[draft_key] = updated_html
+                                slide_content = updated_html  # 更新当前内容用于预览
+                                print(f"[TEXT] ✅ 文字更改已应用并更新 draft_key")
+                                # 清除 URL 参数
+                                if "_t" in st.query_params:
+                                    del st.query_params["_t"]
+                                if "text_change" in st.query_params:
+                                    del st.query_params["text_change"]
+                                print(f"[TEXT] 🔄 清除 URL 参数，准备 rerun")
+                                st.rerun()
+                    except Exception as e:
+                        print(f"[TEXT] ❌ Error processing text change: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        pass
+                
+                # 重要：检查 URL 参数中是否有布局变化 - 必须在加载内容后立即处理
+                layout_param = st.query_params.get("layout")
+                if layout_param:
+                    print(f"[LAYOUT] 🔍 检测到 URL 参数中的 layout: {layout_param[:100]}...")
+                    try:
+                        layout_data_str = layout_param
+                        layout_data = json.loads(layout_data_str)
+                        print(f"[LAYOUT] 📦 解析后的 layout_data: slide_id={layout_data.get('slide_id')}, selector={layout_data.get('selector')}")
+                        if isinstance(layout_data, dict) and layout_data.get("slide_id") == slide_id:
+                            selector = layout_data.get("selector")
+                            print(f"[LAYOUT] ✅ slide_id 匹配，准备应用布局变化")
+                            if selector and slide_content:
+                                # 应用布局变化到当前内容
+                                updated_html = apply_layout_changes_to_html(slide_id, selector, layout_data, slide_content)
+                                st.session_state[draft_key] = updated_html
+                                slide_content = updated_html  # 更新当前内容用于预览
+                                print(f"[LAYOUT] ✅ 布局变化已应用并更新 draft_key")
+                                print(f"[LAYOUT] draft_key={draft_key}")
+                                print(f"[LAYOUT] 更新前内容大小: {len(slide_content)} 字节")
+                                print(f"[LAYOUT] 更新后内容大小: {len(updated_html)} 字节")
+                                print(f"[LAYOUT] selector={selector}, x={layout_data.get('x')}, y={layout_data.get('y')}, width={layout_data.get('width')}, height={layout_data.get('height')}")
+                                # 验证更新是否成功
+                                if draft_key in st.session_state:
+                                    verify_size = len(st.session_state.get(draft_key, ""))
+                                    print(f"[LAYOUT] ✅ 验证: draft_key 中的内容大小: {verify_size} 字节")
+                                else:
+                                    print(f"[LAYOUT] ❌ 错误: draft_key 不存在于 session_state 中！")
+                            else:
+                                print(f"[LAYOUT] ⚠️ selector 或 slide_content 为空: selector={selector}, slide_content长度={len(slide_content) if slide_content else 0}")
+                            
+                            # 清除 URL 参数
+                            if "_t" in st.query_params:
+                                del st.query_params["_t"]
+                            if "layout" in st.query_params:
+                                del st.query_params["layout"]
+                            print(f"[LAYOUT] 🔄 清除 URL 参数，准备 rerun")
+                            st.rerun()
+                        else:
+                            print(f"[LAYOUT] ⚠️ slide_id 不匹配: 期望={slide_id}, 实际={layout_data.get('slide_id')}")
+                    except Exception as e:
+                        print(f"[LAYOUT] ❌ Error processing layout: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        pass
+                else:
+                    print(f"[LAYOUT] ℹ️ 没有检测到 URL 参数中的 layout")
+
+                # 获取当前选中的元素
+                selected_selector = None
+                if (st.session_state.get("selected_element") and 
+                    st.session_state.selected_element.get("slide_id") == slide_id):
+                    selected_selector = st.session_state.selected_element.get("selector")
+
+                # 注入编辑支持（包括元素选择和拖拽）
+                # 只有在布局调整模式下才启用拖动和拉伸功能
+                editing_enabled = bool(st.session_state.get(layout_active_key))
+                print(f"[EDIT] 注入编辑支持，slide_id={slide_id}, enabled={editing_enabled}, selected_selector={selected_selector}, layout_active={st.session_state.get(layout_active_key)}")
+                edited_content = inject_editing_support(slide_content, slide_id, selected_selector, enabled=editing_enabled)
+                
+                # 应用 iframe fixes
+                preview_content = prepare_html_for_preview(edited_content, container_height=600)
+                # 使用 scrolling=False，让 body 的 overflow-y: auto 处理滚动
+                components.html(preview_content, height=600, scrolling=False)
+
+                # 检查 URL 参数中是否有选中信息
+                if st.query_params.get("selected"):
+                    try:
+                        selected_data_str = st.query_params["selected"]
+                        selected_data = json.loads(selected_data_str)
+                        if selected_data.get("slide_id") == slide_id:
+                            current_selected = st.session_state.get("selected_element")
+                            current_selector = current_selected.get("selector") if current_selected and current_selected.get("slide_id") == slide_id else None
+                            current_element_id = current_selected.get("element_id") if current_selected and current_selected.get("slide_id") == slide_id else None
+                            new_selector = selected_data.get("selector")
+                            new_element_id = selected_data.get("element_id")
+                            
+                            if (current_selector != new_selector or 
+                                current_element_id != new_element_id or 
+                                current_selector is None):
+                                st.session_state.selected_element = selected_data
+                                if "_t" in st.query_params:
+                                    del st.query_params["_t"]
+                                if "selected" in st.query_params:
+                                    del st.query_params["selected"]
+                                st.rerun()
+                    except Exception as e:
+                        pass
+
+                # 简化的提示
+                if not selected_selector:
+                    st.caption("👆 点击元素进行选择")
+                else:
+                    st.caption(f"✅ 已选择: {selected_selector}")
             except Exception as e:
                 st.error(f"预览加载失败: {e}")
         else:
             st.warning("幻灯片文件不存在")
     
     with col_edit:
-        st.markdown("**✏️ 修改此幻灯片**")
+        scroll_target = st.session_state.get(scroll_target_key)
+        if scroll_target:
+            st.session_state[scroll_target_key] = None
+
+        # 刷新选择按钮
+        if st.button("🔄 刷新选择", key=f"refresh_selection_{slide_id}", use_container_width=True):
+            st.rerun()
         
-        modification_input = st.text_area(
+        st.divider()
+
+        st.markdown("**布局调整**")
+        if st.button("🧩 布局调整", key=f"enable_layout_{slide_id}", use_container_width=True, disabled=bool(st.session_state.get(layout_active_key))):
+            st.session_state[layout_active_key] = True
+            st.session_state[scroll_target_key] = f"layout_actions_{slide_id}"
+            st.rerun()
+
+        st.markdown(f"<div id='layout_actions_{slide_id}'></div>", unsafe_allow_html=True)
+        if st.session_state.get(layout_active_key):
+            st.caption("已开启：左侧可拖动/拉伸。")
+            # 强制重新获取最新的 draft_content
+            draft_content = st.session_state.get(draft_key)
+            
+            # 调试信息：显示 draft_key 状态
+            if draft_key in st.session_state:
+                content_size = len(st.session_state.get(draft_key, ""))
+                st.caption(f"📝 草稿内容大小: {content_size} 字节")
+            else:
+                st.caption("⚠️ 没有草稿内容，将从文件读取")
+            
+            if draft_content:
+                # 导出按钮（覆盖原文件）
+                if st.button("📦 导出并覆盖原文件", key=f"export_layout_{slide_id}", use_container_width=True, type="primary"):
+                    # 再次强制获取最新的 draft_content（防止按钮点击时的状态问题）
+                    latest_draft = st.session_state.get(draft_key, "")
+                    if not latest_draft:
+                        latest_draft = draft_content
+                    
+                    # 构建文件路径
+                    slide_file_name = slide_meta.get("file", f"{slide_id}.html")
+                    slide_file_path = slides_dir / slide_file_name
+                    
+                    try:
+                        # 确保文件路径正确
+                        if not slide_file_path.parent.exists():
+                            slide_file_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # 确保 draft_content 不为空
+                        if not latest_draft:
+                            st.error("❌ 没有可导出的内容，请先进行修改")
+                            return
+                        
+                        # 使用最新的内容
+                        draft_content = latest_draft
+                        
+                        # 写入文件（覆盖原文件）
+                        slide_file_path.write_text(draft_content, encoding='utf-8')
+                        
+                        # 等待一小段时间确保写入完成
+                        time.sleep(0.1)
+                        
+                        # 验证文件是否写入成功
+                        if not slide_file_path.exists():
+                            raise Exception(f"文件写入失败: {slide_file_path}")
+                        
+                        # 读取验证
+                        verify_content = slide_file_path.read_text(encoding='utf-8')
+                        if verify_content != draft_content:
+                            time.sleep(0.1)
+                            verify_content = slide_file_path.read_text(encoding='utf-8')
+                            if verify_content != draft_content:
+                                raise Exception(f"文件内容验证失败！")
+                        
+                        # 更新 manifest
+                        for s in slides:
+                            if s.get("id") == slide_id:
+                                s["status"] = "modified"
+                                break
+                        manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+                        manifest_path = slides_dir / "manifest.json"
+                        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+                        
+                        # 重要：用新写入的文件内容更新 draft_key
+                        st.session_state[draft_key] = draft_content
+                        
+                        # 清除其他状态
+                        if dirty_key in st.session_state:
+                            del st.session_state[dirty_key]
+                        st.session_state[layout_active_key] = False
+                        st.session_state[toast_key] = "导出成功，已覆盖原文件"
+                        st.success(f"✅ 导出成功，已覆盖原文件！")
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 导出失败: {e}")
+            
+            if st.button("🗑️ 撤回修改", key=f"discard_layout_{slide_id}", use_container_width=True):
+                if draft_key in st.session_state:
+                    del st.session_state[draft_key]
+                if dirty_key in st.session_state:
+                    del st.session_state[dirty_key]
+                st.session_state[layout_active_key] = False
+                st.session_state[toast_key] = "撤回成功"
+                st.success("✅ 撤回成功")
+                st.rerun()
+        else:
+            st.caption("(未开启布局调整)")
+
+        st.divider()
+
+        st.markdown("**描述性修改**")
+        if st.button("📝 描述性修改", key=f"enable_desc_{slide_id}", use_container_width=True, disabled=bool(st.session_state.get(desc_active_key))):
+            st.session_state[desc_active_key] = True
+            st.session_state[scroll_target_key] = f"desc_area_{slide_id}"
+            st.rerun()
+
+        st.markdown(f"<div id='desc_area_{slide_id}'></div>", unsafe_allow_html=True)
+        if st.session_state.get(desc_active_key):
+            modification_input = st.text_area(
             "请描述您想要的修改",
             placeholder="例如：将标题改为红色，添加一个柱状图...",
             height=150,
             key=f"modify_{slide_id}"
         )
         
-        # Placeholder for streaming output - will be populated during modification
-        streaming_container = st.empty()
+            streaming_container = st.empty()
+            if st.button(
+                "🔄 应用修改",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state.slide_modification_in_progress
+            ):
+                if modification_input.strip():
+                    # 应用修改并覆盖原文件
+                    apply_slide_modification(task, slide_index, slide_id, modification_input.strip(), streaming_container, overwrite_file=True)
+                    st.session_state[desc_active_key] = False
+                    st.session_state[toast_key] = "修改已应用并覆盖原文件"
+                    st.success("✅ 修改已应用并覆盖原文件")
+                    st.balloons()
+                    st.rerun()
+
+            if st.button("❌ 取消", key=f"cancel_desc_{slide_id}", use_container_width=True):
+                # 撤回描述性修改
+                st.session_state[desc_active_key] = False
+                st.session_state[toast_key] = "已取消描述性修改"
+                st.success("✅ 已取消")
+                st.rerun()
+        else:
+            st.caption("(未开启描述性修改)")
+
+        st.divider()
+
+        st.markdown("**✏️ 元素编辑器**")
         
-        if st.button(
-            "🔄 应用修改",
-            type="primary",
-            use_container_width=True,
-            disabled=st.session_state.slide_modification_in_progress
-        ):
-            if modification_input.strip():
-                apply_slide_modification(task, slide_index, slide_id, modification_input.strip(), streaming_container)
+        # 检查是否有选中的元素
+        selected_element = st.session_state.get("selected_element")
+        
+        # 如果没有选中元素，显示提示
+        if not selected_element:
+            st.info("👆 点击左侧预览中的元素来选择并编辑")
+        elif selected_element.get("slide_id") != slide_id:
+            st.warning(f"⚠️ 当前选中的元素属于其他幻灯片")
+            if st.button("❌ 清除选择", key=f"clear_mismatch_{slide_id}", use_container_width=True):
+                st.session_state.selected_element = None
+                st.rerun()
+        elif selected_element and selected_element.get("slide_id") == slide_id:
+            selector = selected_element.get("selector", "")
+            element_id = selected_element.get("element_id", "")
+            element_type = selected_element.get("tag", "")
+            element_text = selected_element.get("text", "")[:30]
+            
+            # 获取元素的当前样式
+            current_styles = selected_element.get("styles", {})
+            
+            st.success(f"✅ 已选择: `{element_type}`")
+            if element_text:
+                st.caption(f"文本: {element_text}...")
+            st.caption("💡 可以直接拖拽元素移动位置，拖拽边缘调整大小")
+            
+            st.divider()
+            
+            # 元素编辑控件 - 实时样式编辑
+            st.markdown("**🎨 样式编辑**")
+            
+            # 定义实时更新回调函数
+            def update_style_realtime_callback(prop_name):
+                """实时更新样式的回调函数"""
+                def callback():
+                    key = f"{prop_name}_{slide_id}_{selector}"
+                    value = st.session_state.get(key)
+                    if value is not None:
+                        style_props = {prop_name: value}
+                        if element_id:
+                            style_props['element_id'] = element_id
+                        apply_style_realtime(slide_id, selector, style_props, manifest, slides_dir, element_id)
+                        st.rerun()
+                return callback
+            
+            # 字体选择
+            font_families = [
+                "Arial", "Helvetica", "Times New Roman", "Courier New",
+                "Verdana", "Georgia", "Palatino", "Garamond",
+                "Comic Sans MS", "Trebuchet MS", "Impact",
+                "Microsoft YaHei", "SimHei", "SimSun", "KaiTi",
+                "PingFang SC", "Hiragino Sans GB", "STHeiti",
+                "Roboto", "Open Sans", "Lato", "Montserrat"
+            ]
+            current_font = current_styles.get("fontFamily", "Arial")
+            font_family_index = font_families.index(current_font) if current_font in font_families else 0
+            font_family = st.selectbox(
+                "字体",
+                font_families,
+                index=font_family_index,
+                key=f"font_family_{slide_id}_{selector}",
+                on_change=update_style_realtime_callback('font_family')
+            )
+            
+            # 字体大小
+            current_font_size = current_styles.get("fontSize", 48)
+            font_size = st.slider(
+                "字体大小 (px)",
+                min_value=12,
+                max_value=120,
+                value=int(current_font_size),
+                key=f"font_size_{slide_id}_{selector}",
+                on_change=update_style_realtime_callback('font_size')
+            )
+            
+            # 文字颜色
+            current_color = current_styles.get("color", "#000000")
+            if current_color.startswith("rgb"):
+                current_color = "#000000"
+            color_key = f"color_{slide_id}_{selector}"
+            if color_key not in st.session_state:
+                st.session_state[color_key] = current_color if current_color.startswith("#") else "#000000"
+            
+            def update_color():
+                color_val = st.session_state.get(color_key)
+                if color_val:
+                    style_props = {'color': color_val}
+                    if element_id:
+                        style_props['element_id'] = element_id
+                    apply_style_realtime(slide_id, selector, style_props, manifest, slides_dir, element_id)
+                    st.rerun()
+            
+            color = st.color_picker(
+                "文字颜色",
+                value=st.session_state.get(color_key, current_color if current_color.startswith("#") else "#000000"),
+                key=color_key,
+                on_change=update_color
+            )
+            
+            # 背景颜色
+            current_bg = current_styles.get("backgroundColor", "transparent")
+            if current_bg == "transparent" or current_bg == "rgba(0, 0, 0, 0)":
+                current_bg = "#FFFFFF"
+            elif not current_bg.startswith("#"):
+                current_bg = "#FFFFFF"
+            bg_color_key = f"bg_color_{slide_id}_{selector}"
+            if bg_color_key not in st.session_state:
+                st.session_state[bg_color_key] = current_bg if current_bg.startswith("#") else "#FFFFFF"
+            
+            def update_bg_color():
+                bg_color_val = st.session_state.get(bg_color_key)
+                if bg_color_val:
+                    style_props = {'background_color': bg_color_val}
+                    if element_id:
+                        style_props['element_id'] = element_id
+                    apply_style_realtime(slide_id, selector, style_props, manifest, slides_dir, element_id)
+                    st.rerun()
+            
+            bg_color = st.color_picker(
+                "背景颜色",
+                value=st.session_state.get(bg_color_key, current_bg if current_bg.startswith("#") else "#FFFFFF"),
+                key=bg_color_key,
+                on_change=update_bg_color
+            )
+            
+            # 字体粗细
+            current_weight = current_styles.get("fontWeight", "normal")
+            weight_options = ["normal", "bold", "lighter", "100", "200", "300", "400", "500", "600", "700", "800", "900"]
+            weight_index = weight_options.index(current_weight) if current_weight in weight_options else 0
+            font_weight = st.selectbox(
+                "字体粗细",
+                weight_options,
+                index=weight_index,
+                key=f"font_weight_{slide_id}_{selector}",
+                on_change=update_style_realtime_callback('font_weight')
+            )
+            
+            # 文本对齐
+            current_align = current_styles.get("textAlign", "left")
+            align_options = ["left", "center", "right", "justify"]
+            align_index = align_options.index(current_align) if current_align in align_options else 0
+            text_align = st.selectbox(
+                "文本对齐",
+                align_options,
+                index=align_index,
+                key=f"text_align_{slide_id}_{selector}",
+                on_change=update_style_realtime_callback('text_align')
+            )
+            
+            st.divider()
+            
+            # 导出按钮
+            draft_content = st.session_state.get(draft_key)
+            
+            if draft_content:
+                if st.button("📦 导出并覆盖原文件", key=f"export_slide_{slide_id}", use_container_width=True, type="primary"):
+                    latest_draft = st.session_state.get(draft_key, "")
+                    if not latest_draft:
+                        latest_draft = draft_content
+                    
+                    slide_file_name = slide_meta.get("file", f"{slide_id}.html")
+                    slide_file_path = slides_dir / slide_file_name
+                    
+                    try:
+                        if not slide_file_path.parent.exists():
+                            slide_file_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        if not latest_draft:
+                            st.error("❌ 没有可导出的内容，请先进行修改")
+                            return
+                        
+                        draft_content = latest_draft
+                        slide_file_path.write_text(draft_content, encoding='utf-8')
+                        time.sleep(0.1)
+                        
+                        if not slide_file_path.exists():
+                            raise Exception(f"文件写入失败: {slide_file_path}")
+                        
+                        verify_content = slide_file_path.read_text(encoding='utf-8')
+                        if verify_content != draft_content:
+                            time.sleep(0.1)
+                            verify_content = slide_file_path.read_text(encoding='utf-8')
+                            if verify_content != draft_content:
+                                raise Exception(f"文件内容验证失败！")
+                        
+                        slides_list = manifest.get("slides", [])
+                        for s in slides_list:
+                            if s.get("id") == slide_id:
+                                s["status"] = "modified"
+                                break
+                        
+                        manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+                        manifest_path = slides_dir / "manifest.json"
+                        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+                        
+                        st.session_state[draft_key] = draft_content
+                        
+                        if dirty_key in st.session_state:
+                            del st.session_state[dirty_key]
+                        
+                        st.session_state[toast_key] = "导出成功，已覆盖原文件"
+                        st.success(f"✅ 导出成功，已覆盖原文件！")
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 导出失败: {e}")
+            else:
+                st.info("💡 请先进行样式修改")
+            
+            # 撤回按钮
+            history_key = f"style_history_{slide_id}_{selector}"
+            can_undo = history_key in st.session_state and len(st.session_state.get(history_key, [])) > 0
+            
+            if st.button("↩️ 撤回", key=f"undo_{slide_id}_{selector}", use_container_width=True, disabled=not can_undo):
+                history = st.session_state.get(history_key, [])
+                if history:
+                    previous_html = history.pop()
+                    st.session_state[history_key] = history
+                    st.session_state[draft_key] = previous_html
+                    st.session_state[toast_key] = "已撤回"
+                    st.success("✅ 已撤回")
+                    st.rerun()
+            
+            # 清除选择按钮
+            if st.button("❌ 清除选择", key=f"clear_{slide_id}", use_container_width=True):
+                st.session_state.selected_element = None
+                st.rerun()
+
+        if scroll_target:
+            st.markdown(
+                f"""
+<script>
+(function(){{
+  try{{
+    const el = document.getElementById('{scroll_target}');
+    if (el) el.scrollIntoView({{behavior:'smooth', block:'start'}});
+  }}catch(e){{}}
+}})();
+</script>
+""",
+                unsafe_allow_html=True,
+            )
     
     st.divider()
     
@@ -1633,19 +3092,46 @@ def render_expanded_slide_view(task: Task, manifest: dict):
     with col1:
         if slide_index > 0:
             prev_slide = slides[slide_index - 1]
-            if st.button("← 上一页", use_container_width=True):
+            if st.button("上一页", use_container_width=True):
+                # 清理状态
+                if draft_key in st.session_state:
+                    del st.session_state[draft_key]
+                if dirty_key in st.session_state:
+                    del st.session_state[dirty_key]
+                st.session_state[layout_active_key] = False
+                st.session_state[desc_active_key] = False
+                if st.session_state.get("selected_element") and st.session_state.selected_element.get("slide_id") == slide_id:
+                    st.session_state.selected_element = None
                 st.session_state.grid_expanded_slide = prev_slide.get("id")
                 st.rerun()
     with col3:
         if slide_index < len(slides) - 1:
             next_slide = slides[slide_index + 1]
-            if st.button("下一页 →", use_container_width=True):
+            if st.button("下一页", use_container_width=True):
+                # 清理状态
+                if draft_key in st.session_state:
+                    del st.session_state[draft_key]
+                if dirty_key in st.session_state:
+                    del st.session_state[dirty_key]
+                st.session_state[layout_active_key] = False
+                st.session_state[desc_active_key] = False
+                if st.session_state.get("selected_element") and st.session_state.selected_element.get("slide_id") == slide_id:
+                    st.session_state.selected_element = None
                 st.session_state.grid_expanded_slide = next_slide.get("id")
                 st.rerun()
 
 
-def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedback: str, streaming_container=None):
-    """Apply modification to a slide using the Designer agent with streaming output."""
+def apply_slide_modification(task: Task, slide_index: int, slide_id: str, feedback: str, streaming_container=None, overwrite_file=False):
+    """Apply modification to a slide using the Designer agent with streaming output.
+    
+    Args:
+        task: The current task
+        slide_index: Index of the slide
+        slide_id: ID of the slide
+        feedback: User feedback/description
+        streaming_container: Container for streaming output
+        overwrite_file: If True, the modification will overwrite the original file (default: False, but regenerate_slide already does this)
+    """
     st.session_state.slide_modification_in_progress = True
     
     slides_dir = get_slides_dir(task)
