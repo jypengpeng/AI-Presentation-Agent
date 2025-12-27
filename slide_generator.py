@@ -18,12 +18,31 @@ import asyncio
 import re
 import zipfile
 import threading
+import tempfile
+import shutil
 from pathlib import Path
-from typing import Optional, Callable, Any, Generator
+from typing import Optional, Callable, Any, Generator, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import logging
+
+# Optional imports for PPT generation
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -1032,30 +1051,189 @@ class SlideGenerator:
         
         return output_path
     
-    def create_zip_package(self, slides_dir: Path, output_path: Optional[Path] = None) -> Path:
+    def screenshot_slides(
+        self,
+        slides_dir: Path,
+        output_dir: Optional[Path] = None,
+        width: int = 1920,
+        height: int = 1080
+    ) -> List[Path]:
         """
-        Create a ZIP package containing the presentation and all slides.
+        Take screenshots of all slide HTML files using Selenium.
+        
+        Args:
+            slides_dir: Directory containing slide HTML files
+            output_dir: Optional output directory for screenshots (default: slides_dir/screenshots)
+            width: Viewport width (default: 1920)
+            height: Viewport height (default: 1080)
+        
+        Returns:
+            List of paths to screenshot files
+        
+        Raises:
+            RuntimeError: If Selenium is not available
+        """
+        if not SELENIUM_AVAILABLE:
+            raise RuntimeError(
+                "Selenium is not installed. Please run:\n"
+                "  pip install selenium webdriver-manager"
+            )
+        
+        # Determine output directory
+        if output_dir is None:
+            output_dir = slides_dir / "screenshots"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Read manifest to get slide order
+        manifest_path = slides_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+        
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        slides_meta = manifest.get("slides", [])
+        
+        screenshot_paths = []
+        
+        logger.info(f"Taking screenshots of {len(slides_meta)} slides using Selenium...")
+        
+        # Configure Chrome options for headless mode
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument(f"--window-size={width},{height}")
+        # Force device scale factor for higher quality
+        chrome_options.add_argument("--force-device-scale-factor=2")
+        
+        driver = None
+        try:
+            # Auto-install ChromeDriver
+            service = ChromeService(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_window_size(width, height)
+            
+            for i, slide_meta in enumerate(slides_meta):
+                slide_file = slide_meta.get("file", f"slide_{i+1}.html")
+                slide_path = slides_dir / slide_file
+                
+                if not slide_path.exists():
+                    logger.warning(f"Slide file not found: {slide_path}")
+                    continue
+                
+                # Navigate to the slide file
+                file_url = f"file:///{slide_path.resolve().as_posix()}"
+                driver.get(file_url)
+                
+                # Wait a bit for any animations/transitions to complete
+                import time
+                time.sleep(0.8)
+                
+                # Take screenshot
+                screenshot_name = f"slide_{i+1:03d}.png"
+                screenshot_path = output_dir / screenshot_name
+                driver.save_screenshot(str(screenshot_path))
+                
+                screenshot_paths.append(screenshot_path)
+                logger.info(f"Screenshot saved: {screenshot_path}")
+                
+        finally:
+            if driver:
+                driver.quit()
+        
+        logger.info(f"Created {len(screenshot_paths)} screenshots in {output_dir}")
+        return screenshot_paths
+    
+    def create_pptx_from_screenshots(
+        self,
+        screenshot_paths: List[Path],
+        output_path: Optional[Path] = None,
+        title: str = "Presentation"
+    ) -> Path:
+        """
+        Create a PowerPoint file from slide screenshots.
+        
+        Args:
+            screenshot_paths: List of paths to screenshot images
+            output_path: Optional output path for the PPTX file
+            title: Title for the presentation
+        
+        Returns:
+            Path to the created PPTX file
+        
+        Raises:
+            RuntimeError: If python-pptx is not available
+        """
+        if not PPTX_AVAILABLE:
+            raise RuntimeError(
+                "python-pptx is not installed. Please run:\n"
+                "  pip install python-pptx"
+            )
+        
+        # Determine output path
+        if output_path is None:
+            export_dir = self.workspace_dir / "exported"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            output_path = export_dir / "presentation.pptx"
+        
+        # Create presentation with 16:9 aspect ratio
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)  # 16:9 at standard size
+        prs.slide_height = Inches(7.5)
+        
+        # Blank slide layout (index 6 is typically blank)
+        blank_layout = prs.slide_layouts[6]
+        
+        for screenshot_path in screenshot_paths:
+            if not screenshot_path.exists():
+                logger.warning(f"Screenshot not found: {screenshot_path}")
+                continue
+            
+            # Add a blank slide
+            slide = prs.slides.add_slide(blank_layout)
+            
+            # Add the screenshot as a full-slide background image
+            # Position at (0,0) with full slide dimensions
+            slide.shapes.add_picture(
+                str(screenshot_path),
+                Inches(0),
+                Inches(0),
+                width=prs.slide_width,
+                height=prs.slide_height
+            )
+        
+        # Save the presentation
+        prs.save(str(output_path))
+        logger.info(f"Created PPTX: {output_path}")
+        
+        return output_path
+    
+    def create_zip_package(
+        self,
+        slides_dir: Path,
+        output_path: Optional[Path] = None,
+        include_pptx: bool = True,
+        return_bytes: bool = False
+    ):
+        """
+        Create a ZIP package containing the presentation, all slides, and optionally a PPTX.
         
         The ZIP structure:
         - presentation.html (main file to open)
+        - presentation.pptx (PowerPoint version, optional)
         - slides/ (all slide HTML files)
         - README.md (keyboard shortcuts guide)
         
         Args:
             slides_dir: Directory containing slide HTML files
             output_path: Optional output path for the ZIP file
+            include_pptx: Whether to generate and include PPTX (default: True)
+            return_bytes: If True, return ZIP as bytes instead of saving to file
         
         Returns:
-            Path to the created ZIP file
+            Path to the created ZIP file, or bytes if return_bytes=True
         """
-        import tempfile
-        
-        export_dir = self.workspace_dir / "exported"
-        export_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Determine output path
-        if output_path is None:
-            output_path = export_dir / "presentation.zip"
+        import io
         
         # Read manifest for title
         manifest_path = slides_dir / "manifest.json"
@@ -1067,22 +1245,50 @@ class SlideGenerator:
             except:
                 pass
         
-        # Generate presentation.html with correct paths for ZIP structure
-        # In ZIP: presentation.html and slides/ are in the same directory
-        # So we use "slides/" instead of "../slides/"
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as tmp:
-            tmp_path = Path(tmp.name)
-        
-        self.export_to_single_file(slides_dir, output_path=tmp_path, slides_path_prefix="slides/")
-        
-        # Create README content
-        readme_content = f"""# {title}
+        # Create a temporary directory for building the package
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            
+            # Generate presentation.html with correct paths for ZIP structure
+            html_path = tmp_path / "presentation.html"
+            self.export_to_single_file(slides_dir, output_path=html_path, slides_path_prefix="slides/")
+            
+            # Generate PPTX if requested and libraries are available
+            pptx_path = None
+            if include_pptx and SELENIUM_AVAILABLE and PPTX_AVAILABLE:
+                try:
+                    logger.info("Generating screenshots for PPTX...")
+                    screenshot_dir = tmp_path / "screenshots"
+                    screenshot_paths = self.screenshot_slides(slides_dir, output_dir=screenshot_dir)
+                    
+                    if screenshot_paths:
+                        logger.info("Creating PPTX from screenshots...")
+                        pptx_path = tmp_path / "presentation.pptx"
+                        self.create_pptx_from_screenshots(screenshot_paths, output_path=pptx_path, title=title)
+                except Exception as e:
+                    logger.warning(f"Failed to generate PPTX: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    pptx_path = None
+            elif include_pptx:
+                if not SELENIUM_AVAILABLE:
+                    logger.warning("Selenium not available, skipping PPTX generation")
+                if not PPTX_AVAILABLE:
+                    logger.warning("python-pptx not available, skipping PPTX generation")
+            
+            # Create README content
+            pptx_note = ""
+            if pptx_path and pptx_path.exists():
+                pptx_note = "├── presentation.pptx    # PowerPoint 版本\n"
+            
+            readme_content = f"""# {title}
 
 ## 使用说明
 
 打开 `presentation.html` 文件即可开始演示。
+{"也可以使用 `presentation.pptx` 在 PowerPoint 中打开。" if pptx_path else ""}
 
-## 键盘快捷键
+## 键盘快捷键 (HTML 版本)
 
 | 按键 | 功能 |
 |------|------|
@@ -1099,7 +1305,7 @@ class SlideGenerator:
 
 ```
 ├── presentation.html    # 主文件，打开此文件开始演示
-├── slides/              # 幻灯片文件目录
+{pptx_note}├── slides/              # 幻灯片文件目录
 │   ├── slide_1.html
 │   ├── slide_2.html
 │   └── ...
@@ -1112,30 +1318,60 @@ class SlideGenerator:
 - 建议使用现代浏览器（Chrome、Firefox、Edge）打开
 - 如需编辑单个幻灯片，可直接修改 `slides` 文件夹中的 HTML 文件
 """
-        
-        # Create ZIP file
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Add presentation.html (with correct paths for ZIP structure)
-            zf.write(tmp_path, 'presentation.html')
             
-            # Add README.md
-            zf.writestr('README.md', readme_content)
-            
-            # Add all files from slides directory
-            for file_path in slides_dir.iterdir():
-                if file_path.is_file():
-                    arcname = f'slides/{file_path.name}'
-                    zf.write(file_path, arcname)
-        
-        # Clean up temp file
-        try:
-            tmp_path.unlink()
-        except:
-            pass
-        
-        logger.info(f"Created ZIP package: {output_path}")
-        
-        return output_path
+            # Create ZIP in memory or to file
+            if return_bytes:
+                # Create ZIP in memory
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    # Add presentation.html
+                    zf.write(html_path, 'presentation.html')
+                    
+                    # Add presentation.pptx if generated
+                    if pptx_path and pptx_path.exists():
+                        zf.write(pptx_path, 'presentation.pptx')
+                    
+                    # Add README.md
+                    zf.writestr('README.md', readme_content)
+                    
+                    # Add all files from slides directory
+                    for file_path in slides_dir.iterdir():
+                        if file_path.is_file():
+                            arcname = f'slides/{file_path.name}'
+                            zf.write(file_path, arcname)
+                
+                zip_buffer.seek(0)
+                logger.info("Created ZIP package in memory")
+                return zip_buffer.getvalue()
+            else:
+                # Create ZIP to file
+                export_dir = self.workspace_dir / "exported"
+                export_dir.mkdir(parents=True, exist_ok=True)
+                
+                if output_path is None:
+                    # Use timestamp to avoid file locking issues
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_path = export_dir / f"presentation_{timestamp}.zip"
+                
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    # Add presentation.html
+                    zf.write(html_path, 'presentation.html')
+                    
+                    # Add presentation.pptx if generated
+                    if pptx_path and pptx_path.exists():
+                        zf.write(pptx_path, 'presentation.pptx')
+                    
+                    # Add README.md
+                    zf.writestr('README.md', readme_content)
+                    
+                    # Add all files from slides directory
+                    for file_path in slides_dir.iterdir():
+                        if file_path.is_file():
+                            arcname = f'slides/{file_path.name}'
+                            zf.write(file_path, arcname)
+                
+                logger.info(f"Created ZIP package: {output_path}")
+                return output_path
     
     # =========================================================================
     # Single Slide Modification

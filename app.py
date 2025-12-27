@@ -2,9 +2,9 @@
 Streamlit UI for the Autonomous Presentation Agent
 
 Features:
-- Left sidebar: API Key settings, task management, task settings
-- Main area left: Chat log with highlighted tool calls
-- Main area right: Real-time HTML preview
+- Apple-style minimal design
+- Left panel: Task management and settings
+- Right panel: Main input area with streaming dialog
 - Multi-task support with persistence
 """
 
@@ -35,195 +35,369 @@ load_dotenv()
 # ============================================================================
 
 st.set_page_config(
-    page_title="AI Presentation Agent",
+    page_title="AI 生成 PPT",
     page_icon="🎨",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for better styling
+# Apple-style Custom CSS - Matching reference design exactly
 st.markdown("""
 <style>
-    /* Main container */
+    /* CSS Variables - Apple Style */
+    :root {
+        --bg: #f5f6f7;
+        --card: #ffffff;
+        --text: #0f172a;
+        --muted: #6b7280;
+        --border: #e5e7eb;
+        --accent: #0a84ff;
+        --accent-dark: #0f172a;
+        --shadow: 0 10px 30px rgba(17,24,39,.08);
+        --radius: 16px;
+    }
+    
+    /* Hide Streamlit default elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stDeployButton {display: none;}
+    
+    /* Reset and base styles */
+    .stApp {
+        background-color: var(--bg) !important;
+    }
+    
+    /* Main container - Centered card */
     .main .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
+        max-width: 1100px !important;
+        padding: 40px !important;
+        margin: 40px auto !important;
+        background: var(--card) !important;
+        border-radius: 20px !important;
+        box-shadow: var(--shadow) !important;
     }
     
-    /* Chat message styling */
-    .chat-message {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 0.5rem;
+    /* Hide sidebar completely */
+    [data-testid="stSidebar"] {
+        display: none !important;
     }
     
-    .user-message {
-        background-color: #e3f2fd;
-        border-left: 4px solid #2196f3;
+    /* Side title styling */
+    .side-title {
+        font-weight: 700;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
     }
     
-    .assistant-message {
-        background-color: #f5f5f5;
-        border-left: 4px solid #4caf50;
+    /* Headline - Large bold title */
+    .headline {
+        font-size: 40px !important;
+        font-weight: 900 !important;
+        margin-bottom: 8px !important;
+        color: var(--text) !important;
+        line-height: 1.2 !important;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important;
     }
     
-    .tool-call {
-        background-color: #fff3e0;
-        border-left: 4px solid #ff9800;
-        font-family: monospace;
-        font-size: 0.85rem;
+    .sub-headline {
+        color: #94a3b8 !important;
+        margin-bottom: 22px !important;
+        font-size: 16px !important;
     }
     
-    .tool-result-success {
-        background-color: #e8f5e9;
-        border-left: 4px solid #4caf50;
-        font-family: monospace;
-        font-size: 0.85rem;
+    /* Text area styling */
+    .stTextArea textarea {
+        border: 1px solid var(--border) !important;
+        background: #f8fafc !important;
+        border-radius: 12px !important;
+        padding: 16px !important;
+        font-size: 15px !important;
+        min-height: 180px !important;
+        resize: vertical !important;
     }
     
-    .tool-result-error {
-        background-color: #ffebee;
-        border-left: 4px solid #f44336;
-        font-family: monospace;
-        font-size: 0.85rem;
+    .stTextArea textarea:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.1) !important;
     }
     
-    .error-message {
-        background-color: #ffebee;
-        border-left: 4px solid #f44336;
-        padding: 1rem;
-        border-radius: 0.5rem;
+    .stTextArea textarea::placeholder {
+        color: #9ca3af !important;
     }
     
-    .completion-message {
-        background-color: #e8f5e9;
-        border-left: 4px solid #4caf50;
-        padding: 1rem;
-        border-radius: 0.5rem;
+    /* Text input styling */
+    .stTextInput input {
+        border: 1px solid var(--border) !important;
+        background: #f8fafc !important;
+        border-radius: 12px !important;
+        padding: 12px !important;
+        font-size: 15px !important;
     }
     
-    /* Sidebar styling */
-    .sidebar .sidebar-content {
-        padding: 1rem;
+    .stTextInput input:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.1) !important;
     }
     
-    /* Preview iframe */
-    .preview-container {
-        border: 1px solid #ddd;
-        border-radius: 0.5rem;
+    /* Button styling - Default */
+    .stButton > button {
+        border: 1px solid var(--border) !important;
+        background: var(--card) !important;
+        color: var(--text) !important;
+        border-radius: 10px !important;
+        padding: 8px 16px !important;
+        font-weight: 600 !important;
+        transition: all 0.2s ease !important;
+        font-size: 14px !important;
+    }
+    
+    .stButton > button:hover {
+        background: #f3f4f6 !important;
+        border-color: #d1d5db !important;
+    }
+    
+    /* Primary button - Generate PPT */
+    .stButton > button[kind="primary"],
+    .stButton > button[data-testid="baseButton-primary"] {
+        background: #cbd5e1 !important;
+        color: #fff !important;
+        border: none !important;
+        border-radius: 14px !important;
+        padding: 14px 28px !important;
+        font-weight: 700 !important;
+        font-size: 16px !important;
+        transition: all 0.25s ease !important;
+    }
+    
+    .stButton > button[kind="primary"]:hover,
+    .stButton > button[data-testid="baseButton-primary"]:hover {
+        background: var(--accent-dark) !important;
+        box-shadow: 0 0 0 8px rgba(15,23,42,.12) !important;
+        transform: translateY(-1px) !important;
+    }
+    
+    /* Secondary button styling for active task */
+    .stButton > button[kind="secondary"][data-testid="baseButton-secondary"] {
+        border-radius: 12px !important;
+    }
+    
+    /* Task button - active state (dark background) */
+    div[data-testid="column"] .stButton > button[kind="primary"] {
+        background: var(--accent-dark) !important;
+        color: #fff !important;
+        border-radius: 12px !important;
+        padding: 10px 14px !important;
+        font-size: 14px !important;
+    }
+    
+    /* Chip/Template buttons */
+    .chip-button .stButton > button {
+        background: #f3f4f6 !important;
+        border: none !important;
+        border-radius: 999px !important;
+        padding: 10px 18px !important;
+        color: #475569 !important;
+        font-weight: 700 !important;
+    }
+    
+    .chip-button .stButton > button:hover {
+        background: #edeff2 !important;
+    }
+    
+    /* Streaming dialog - Fixed position floating box */
+    .stream-dialog {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        width: 420px;
+        max-height: 520px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        box-shadow: 0 20px 40px rgba(0,0,0,.15);
+        z-index: 9999;
         overflow: hidden;
+        display: flex;
+        flex-direction: column;
     }
     
-    /* Tool name badge */
+    .stream-dialog-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--border);
+        background: #fafbfc;
+    }
+    
+    .stream-dialog-title {
+        font-weight: 700;
+        font-size: 14px;
+        color: var(--text);
+    }
+    
+    .stream-dialog-body {
+        padding: 16px 18px;
+        overflow-y: auto;
+        max-height: 420px;
+        flex: 1;
+    }
+    
+    .stream-dialog-close {
+        background: none;
+        border: none;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 6px;
+        color: var(--muted);
+        font-size: 16px;
+    }
+    
+    .stream-dialog-close:hover {
+        background: #f3f4f6;
+    }
+    
+    /* Chat message styling - compact for dialog */
+    .chat-msg {
+        padding: 10px 12px;
+        border-radius: 10px;
+        margin-bottom: 8px;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+    
+    .chat-msg.user {
+        background: #e3f2fd;
+        border-left: 3px solid #2196f3;
+    }
+    
+    .chat-msg.assistant {
+        background: #f5f5f5;
+        border-left: 3px solid #4caf50;
+    }
+    
+    .chat-msg.tool {
+        background: #fff3e0;
+        border-left: 3px solid #ff9800;
+        font-family: 'SF Mono', Monaco, monospace;
+        font-size: 12px;
+    }
+    
+    .chat-msg.error {
+        background: #ffebee;
+        border-left: 3px solid #f44336;
+    }
+    
+    .chat-msg.success {
+        background: #e8f5e9;
+        border-left: 3px solid #4caf50;
+    }
+    
+    /* Tool badge */
     .tool-badge {
         display: inline-block;
-        background-color: #ff9800;
+        background: #ff9800;
         color: white;
-        padding: 0.2rem 0.5rem;
-        border-radius: 0.25rem;
-        font-weight: bold;
-        margin-right: 0.5rem;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 11px;
+        margin-right: 6px;
     }
     
-    /* Task list styling */
-    .task-item {
-        padding: 0.5rem;
-        border-radius: 0.25rem;
-        margin-bottom: 0.25rem;
-        cursor: pointer;
+    /* Footer styling */
+    .footer-text {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: #94a3b8;
+        font-size: 13px;
+        margin-top: 24px;
+        padding-top: 16px;
+        border-top: 1px solid var(--border);
     }
     
-    .task-item:hover {
-        background-color: rgba(255, 255, 255, 0.1);
+    .footer-text a {
+        color: #64748b;
+        text-decoration: none;
     }
     
-    .task-item.active {
-        background-color: rgba(33, 150, 243, 0.2);
-        border-left: 3px solid #2196f3;
+    .footer-text a:hover {
+        text-decoration: underline;
+    }
+    
+    /* Label styling */
+    .stTextInput label, .stTextArea label {
+        font-size: 13px !important;
+        color: var(--muted) !important;
+        font-weight: 500 !important;
+    }
+    
+    /* Divider/separator styling */
+    hr {
+        border: none !important;
+        border-top: 1px solid var(--border) !important;
+        margin: 16px 0 !important;
+    }
+    
+    /* Caption styling */
+    .stCaption {
+        color: var(--muted) !important;
+    }
+    
+    /* Column gap adjustment */
+    [data-testid="column"] {
+        padding: 0 8px !important;
     }
     
     /* Grid view card styling */
     .slide-card {
-        border: 1px solid #ddd;
-        border-radius: 0.5rem;
-        padding: 0.5rem;
-        margin-bottom: 0.5rem;
-        background-color: #fafafa;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
         transition: all 0.2s ease;
     }
     
     .slide-card:hover {
-        border-color: #2196f3;
-        box-shadow: 0 2px 8px rgba(33, 150, 243, 0.2);
+        border-color: var(--accent);
+        box-shadow: 0 4px 12px rgba(10, 132, 255, 0.15);
     }
     
-    .slide-card.status-pending {
-        border-left: 4px solid #9e9e9e;
+    .slide-card.completed {
+        border-left: 4px solid #4caf50;
     }
     
-    .slide-card.status-generating {
+    .slide-card.generating {
         border-left: 4px solid #2196f3;
         animation: pulse 1.5s infinite;
     }
     
-    .slide-card.status-completed {
-        border-left: 4px solid #4caf50;
+    .slide-card.pending {
+        border-left: 4px solid #9e9e9e;
     }
     
-    .slide-card.status-failed {
+    .slide-card.failed {
         border-left: 4px solid #f44336;
     }
     
-    .slide-card.status-modified {
-        border-left: 4px solid #ff9800;
-    }
-    
     @keyframes pulse {
-        0% { opacity: 1; }
-        50% { opacity: 0.7; }
-        100% { opacity: 1; }
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
     }
     
-    .slide-card-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
+    /* Markdown styling */
+    .stMarkdown p {
         margin-bottom: 0.5rem;
     }
     
-    .slide-card-title {
-        font-weight: bold;
-        font-size: 0.9rem;
-        color: #333;
-    }
-    
-    .slide-card-type {
-        font-size: 0.75rem;
-        color: #666;
-        background-color: #e0e0e0;
-        padding: 0.1rem 0.4rem;
-        border-radius: 0.25rem;
-    }
-    
-    .slide-card-preview {
-        height: 120px;
-        background-color: #f5f5f5;
-        border-radius: 0.25rem;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-    }
-    
-    .slide-card-preview iframe {
-        width: 100%;
-        height: 100%;
-        border: none;
-        pointer-events: none;
-    }
-    
-    .status-icon {
-        font-size: 1.2rem;
+    /* Info/Warning/Error boxes */
+    .stAlert {
+        border-radius: 12px !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -331,6 +505,32 @@ def init_session_state():
     # Slide modification state
     if "slide_modification_in_progress" not in st.session_state:
         st.session_state.slide_modification_in_progress = False
+    
+    # Streaming dialog state
+    if "show_streaming_dialog" not in st.session_state:
+        st.session_state.show_streaming_dialog = False
+    
+    if "streaming_dialog_content" not in st.session_state:
+        st.session_state.streaming_dialog_content = []
+    
+    if "streaming_current_text" not in st.session_state:
+        st.session_state.streaming_current_text = ""
+    
+    # Template selection state
+    if "selected_template" not in st.session_state:
+        st.session_state.selected_template = None
+    
+    # Force main view flag (prevents auto-redirect to grid view)
+    if "force_main_view" not in st.session_state:
+        st.session_state.force_main_view = False
+    
+    # Pending generation message (for inline processing)
+    if "pending_generation_message" not in st.session_state:
+        st.session_state.pending_generation_message = None
+    
+    # Selected template value (for filling text area)
+    if "selected_template_value" not in st.session_state:
+        st.session_state.selected_template_value = ""
 
 
 init_session_state()
@@ -398,6 +598,11 @@ def sync_phase_with_task():
     """
     task = get_current_task()
     if not task:
+        st.session_state.current_phase = "collecting"
+        return
+    
+    # Don't override if user explicitly requested main view
+    if st.session_state.get("force_main_view"):
         st.session_state.current_phase = "collecting"
         return
     
@@ -1904,8 +2109,16 @@ def render_grid_view():
             st.session_state.grid_expanded_slide = None
         return
     
-    # Header
-    st.subheader("📊 幻灯片生成监控")
+    # Top navigation bar with back button
+    col_back, col_title = st.columns([1, 5])
+    with col_back:
+        if st.button("← 返回主页", use_container_width=True, type="secondary", key="grid_back_btn"):
+            st.session_state.current_phase = "collecting"
+            st.session_state.grid_expanded_slide = None
+            st.session_state.force_main_view = True  # Prevent auto-redirect
+            st.rerun()
+    with col_title:
+        st.subheader("📊 幻灯片生成监控")
     
     # Get manifest data
     manifest = get_manifest_data(task)
@@ -2284,7 +2497,7 @@ def render_multi_slide_preview(task: Task, slide_files: List[Path]):
 
 
 def export_slides(task: Task):
-    """Export multi-file slides to a single HTML file."""
+    """Export slides to a ZIP package containing HTML and PPTX."""
     slides_dir = get_slides_dir(task)
     if not slides_dir:
         st.error("未找到幻灯片目录")
@@ -2296,16 +2509,37 @@ def export_slides(task: Task):
         return
     
     try:
-        output_path = generator.export_to_single_file(slides_dir)
-        st.success(f"✅ 导出成功: {output_path}")
+        # Show progress indicator
+        with st.spinner("正在生成导出包（包含 HTML 和 PPTX）..."):
+            # Use return_bytes=True to get ZIP data in memory, avoiding file locking issues
+            result = generator.create_zip_package(slides_dir, include_pptx=True, return_bytes=True)
         
-        # Update task html_file to point to exported file
-        relative_path = output_path.relative_to(Path(task.workspace_dir))
-        st.session_state.task_manager.update_task(task.id, html_file=str(relative_path))
+        # Ensure we have bytes data
+        if isinstance(result, bytes):
+            zip_data: bytes = result
+        else:
+            # If return_bytes failed, read from file path
+            with open(result, "rb") as f:
+                zip_data = f.read()
+        
+        st.success(f"✅ 导出成功!")
+        
+        # Provide download button directly with bytes data
+        st.download_button(
+            label="📥 下载演示文稿包 (ZIP)",
+            data=zip_data,
+            file_name="presentation.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+        
+        st.caption("包含 presentation.html 和 presentation.pptx（如果生成成功）")
         st.session_state.preview_key += 1
-        st.rerun()
+        
     except Exception as e:
         st.error(f"导出失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 def validate_presentation_plan(plan_json: str) -> Tuple[bool, Optional[dict], Optional[str]]:
@@ -3303,49 +3537,603 @@ def refine_current_slide(task: Task, feedback: str, live_container=None):
 
 
 # ============================================================================
+# Streaming Dialog Component
+# ============================================================================
+
+def render_streaming_dialog():
+    """Render the floating streaming dialog for LLM responses."""
+    if not st.session_state.get("show_streaming_dialog", False):
+        return
+    
+    # Get the streaming content
+    streaming_content = st.session_state.get("streaming_dialog_content", [])
+    current_text = st.session_state.get("streaming_current_text", "")
+    
+    # Build the dialog HTML
+    messages_html = ""
+    for msg in streaming_content[-10:]:  # Show last 10 messages
+        msg_type = msg.get("type", "")
+        if msg_type == "user_message":
+            messages_html += f'<div class="chat-msg user">{msg.get("content", "")}</div>'
+        elif msg_type == "assistant_message":
+            content = msg.get("content", "")
+            if len(content) > 500:
+                content = content[:500] + "..."
+            messages_html += f'<div class="chat-msg assistant">{content}</div>'
+        elif msg_type == "tool_call":
+            tc = msg.get("tool_call", {})
+            name = tc.get("name", "") if isinstance(tc, dict) else tc.name
+            messages_html += f'<div class="chat-msg tool"><span class="tool-badge">🔧 {name}</span></div>'
+        elif msg_type == "tool_result":
+            tc = msg.get("tool_call", {})
+            result = tc.get("result", {}) if isinstance(tc, dict) else tc.result
+            success = result.get("success", False) if isinstance(result, dict) else (result.success if result else False)
+            if success:
+                messages_html += '<div class="chat-msg success">✅ 执行成功</div>'
+            else:
+                error = result.get("error", "") if isinstance(result, dict) else (result.error if result else "")
+                messages_html += f'<div class="chat-msg error">❌ {error[:100]}</div>'
+    
+    # Add current streaming text
+    if current_text:
+        display_text = current_text[-800:] if len(current_text) > 800 else current_text
+        messages_html += f'''
+        <div class="chat-msg assistant" style="border-left-color: #2196f3;">
+            <span style="color: #888; font-size: 11px;">正在输入...</span><br>
+            <pre style="margin: 4px 0 0 0; white-space: pre-wrap; font-size: 12px;">{display_text}</pre>
+        </div>
+        '''
+    
+    dialog_html = f'''
+    <div class="stream-dialog" id="streamDialog">
+        <div class="stream-dialog-header">
+            <span class="stream-dialog-title">🤖 AI 响应</span>
+            <button class="stream-dialog-close" onclick="document.getElementById('streamDialog').style.display='none'">✕</button>
+        </div>
+        <div class="stream-dialog-body">
+            {messages_html if messages_html else '<p style="color: #94a3b8; margin: 0;">等待响应...</p>'}
+        </div>
+    </div>
+    '''
+    
+    st.markdown(dialog_html, unsafe_allow_html=True)
+
+
+def render_left_panel():
+    """Render the left panel with task management."""
+    task_manager = st.session_state.task_manager
+    tasks = task_manager.list_tasks()
+    active_task = task_manager.get_active_task()
+    
+    # Section: Task Management
+    st.markdown('<div class="side-title">任务管理</div>', unsafe_allow_html=True)
+    
+    # Task list header with new task button
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        st.markdown("**任务列表**")
+    with col2:
+        if st.button("＋ 新建任务", key="new_task_btn", use_container_width=True):
+            st.session_state.show_new_task_dialog = True
+            st.rerun()
+    
+    # New task dialog
+    if st.session_state.show_new_task_dialog:
+        with st.container():
+            st.markdown("---")
+            if st.session_state.copy_in_progress:
+                st.info("⏳ 正在复制文件...")
+            elif not st.session_state.pending_source_dir:
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("📂 选择目录", use_container_width=True, type="primary"):
+                        handle_directory_selection()
+                        st.rerun()
+                with col2:
+                    if st.button("取消", use_container_width=True):
+                        st.session_state.show_new_task_dialog = False
+                        st.rerun()
+            else:
+                source_dir = st.session_state.pending_source_dir
+                st.caption(f"📁 {source_dir}")
+                
+                scan_result = st.session_state.pending_scan_result
+                if scan_result:
+                    st.caption(f"📊 {scan_result.total_files} 文件, {scan_result.total_size_mb:.1f} MB")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ 确认", use_container_width=True, type="primary"):
+                        create_task_with_copy()
+                        st.rerun()
+                with col2:
+                    if st.button("❌ 取消", use_container_width=True):
+                        st.session_state.pending_source_dir = None
+                        st.session_state.pending_pick_result = None
+                        st.session_state.pending_scan_result = None
+                        st.session_state.show_new_task_dialog = False
+                        st.rerun()
+            st.markdown("---")
+    
+    # Task list
+    if not tasks:
+        st.caption("暂无任务")
+    else:
+        for task in tasks:
+            is_active = active_task and task.id == active_task.id
+            
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                btn_type = "primary" if is_active else "secondary"
+                icon = "✓" if is_active else "○"
+                if st.button(
+                    f"{icon} {task.name}",
+                    key=f"task_{task.id}",
+                    use_container_width=True,
+                    type=btn_type
+                ):
+                    if not is_active:
+                        task_manager.switch_task(task.id)
+                        st.session_state.preview_key += 1
+                        st.session_state.show_plan_editor = False
+                        st.session_state.pending_presentation_plan = None
+                        st.session_state.grid_expanded_slide = None
+                        sync_phase_with_task()
+                        st.rerun()
+            
+            with col2:
+                if st.button("🗑", key=f"del_{task.id}"):
+                    task_manager.delete_task(task.id)
+                    if task.id in st.session_state.agents:
+                        del st.session_state.agents[task.id]
+                    st.rerun()
+    
+    st.markdown("---")
+    
+    # Section: Current Task Settings
+    if active_task:
+        st.markdown('<div class="side-title">当前任务设置</div>', unsafe_allow_html=True)
+        
+        # Task name
+        new_name = st.text_input(
+            "任务名称",
+            value=active_task.name,
+            key="left_task_name"
+        )
+        if new_name != active_task.name:
+            task_manager.update_task(active_task.id, name=new_name)
+        
+        # HTML file path
+        new_html = st.text_input(
+            "HTML 文件路径",
+            value=active_task.html_file,
+            key="left_html_path",
+            help="相对于工作目录"
+        )
+        if new_html != active_task.html_file:
+            task_manager.update_task(active_task.id, html_file=new_html)
+            st.session_state.preview_key += 1
+
+
+def render_right_panel():
+    """Render the right panel with main input area on top and streaming output below."""
+    task = get_current_task()
+    
+    # Template definitions
+    templates = {
+        "年度总结": "请为公司年度总结生成 PPT：经营指标、亮点、团队成就、问题复盘、来年规划。建议 12-18 页。",
+        "产品发布会": "新品发布会：愿景定位、用户痛点、功能演示、技术亮点、路线图、价格与计划、Q&A。",
+        "项目汇报": "项目阶段汇报：目标、里程碑、当前进度、风险/对策、资源需求、下一步计划。",
+        "商业计划书": "商业计划书：市场分析、商业模式、产品方案、竞争壁垒、财务预测、团队与融资。"
+    }
+    template_list = list(templates.items())
+    
+    # Check if a template was selected (before widget is rendered)
+    selected_template_value = st.session_state.get("selected_template_value", "")
+    if selected_template_value:
+        st.session_state.selected_template_value = ""  # Clear it
+    
+    # ========== TOP SECTION: Input Area ==========
+    # Headline
+    st.markdown('<div class="headline">描述你的想法</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-headline">AI将帮助你生成完整的演示文稿</div>', unsafe_allow_html=True)
+    
+    # Main text area - use default value from template if selected
+    default_value = selected_template_value if selected_template_value else ""
+    user_idea = st.text_area(
+        "your_idea",
+        value=default_value,
+        placeholder="例如：制作一份关于公司2024年度总结的PPT，包括业绩数据、团队成就和未来规划……",
+        height=150,
+        label_visibility="collapsed",
+        key="main_idea_input"
+    )
+    
+    # Button row: Generate button + Quick chips in one line
+    col_btn, col_chip1, col_chip2, col_chip3, col_chip4 = st.columns([1.5, 1, 1, 1, 1])
+    
+    with col_btn:
+        # Generate button - disabled if no input or processing
+        can_generate = bool(user_idea.strip()) and not st.session_state.is_processing and task is not None
+        
+        if st.button(
+            "🎨 生成PPT",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_generate
+        ):
+            if task and user_idea.strip():
+                st.session_state.pending_generation_message = user_idea.strip()
+    
+    with col_chip1:
+        if st.button(template_list[0][0], key="chip_0", use_container_width=True):
+            st.session_state.selected_template_value = template_list[0][1]
+            st.rerun()
+    
+    with col_chip2:
+        if st.button(template_list[1][0], key="chip_1", use_container_width=True):
+            st.session_state.selected_template_value = template_list[1][1]
+            st.rerun()
+    
+    with col_chip3:
+        if st.button(template_list[2][0], key="chip_2", use_container_width=True):
+            st.session_state.selected_template_value = template_list[2][1]
+            st.rerun()
+    
+    with col_chip4:
+        if st.button(template_list[3][0], key="chip_3", use_container_width=True):
+            st.session_state.selected_template_value = template_list[3][1]
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # ========== BOTTOM SECTION: Streaming Output Area ==========
+    st.markdown("**🤖 AI 响应**")
+    
+    # Create a container for streaming output
+    streaming_container = st.container()
+    
+    # If there's a pending generation, process it
+    if st.session_state.get("pending_generation_message") and task:
+        message = st.session_state.pending_generation_message
+        st.session_state.pending_generation_message = None
+        process_user_message_inline(task, message, streaming_container)
+    
+    # Show existing chat history or placeholder
+    with streaming_container:
+        if task and task.chat_history:
+            # Show last few messages
+            for event in task.chat_history[-6:]:
+                render_inline_message(event)
+        elif not st.session_state.is_processing:
+            st.markdown(
+                '<div style="color: #94a3b8; padding: 20px; text-align: center;">'
+                '💬 输入您的想法并点击生成按钮，AI响应将在这里显示'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+
+def render_inline_message(event: dict):
+    """Render a chat message inline (not in floating dialog)."""
+    event_type = event.get("type")
+    
+    if event_type == "user_message":
+        st.markdown(f'''
+        <div class="chat-msg user">
+            <strong>👤 您:</strong> {event.get("content", "")[:200]}{"..." if len(event.get("content", "")) > 200 else ""}
+        </div>
+        ''', unsafe_allow_html=True)
+    
+    elif event_type == "assistant_message":
+        content = event.get("content", "")
+        if len(content) > 300:
+            content = content[:300] + "..."
+        st.markdown(f'''
+        <div class="chat-msg assistant">
+            <strong>🤖 AI:</strong> {content}
+        </div>
+        ''', unsafe_allow_html=True)
+    
+    elif event_type == "tool_call":
+        tc = event.get("tool_call", {})
+        name = tc.get("name", "") if isinstance(tc, dict) else tc.name
+        st.markdown(f'''
+        <div class="chat-msg tool">
+            <span class="tool-badge">🔧 {name}</span>
+        </div>
+        ''', unsafe_allow_html=True)
+    
+    elif event_type == "tool_result":
+        tc = event.get("tool_call", {})
+        result = tc.get("result", {}) if isinstance(tc, dict) else tc.result
+        success = result.get("success", False) if isinstance(result, dict) else (result.success if result else False)
+        if success:
+            st.markdown('<div class="chat-msg success">✅ 执行成功</div>', unsafe_allow_html=True)
+        else:
+            error = result.get("error", "") if isinstance(result, dict) else (result.error if result else "")
+            st.markdown(f'<div class="chat-msg error">❌ {error[:100]}</div>', unsafe_allow_html=True)
+    
+    elif event_type == "error":
+        st.markdown(f'''
+        <div class="chat-msg error">
+            ❌ {event.get("error", "")}
+        </div>
+        ''', unsafe_allow_html=True)
+    
+    elif event_type == "task_completed":
+        st.markdown(f'''
+        <div class="chat-msg success">
+            ✨ {event.get("result", "完成")}
+        </div>
+        ''', unsafe_allow_html=True)
+
+
+def process_user_message_inline(task: Task, message: str, container):
+    """Process user message and show streaming output inline in the container."""
+    st.session_state.is_processing = True
+    
+    agent = get_or_create_agent(task)
+    if agent is None:
+        st.session_state.is_processing = False
+        return
+    
+    task_manager = st.session_state.task_manager
+    
+    # Add user message
+    user_event = {"type": "user_message", "content": message}
+    task_manager.add_chat_message(task.id, user_event)
+    
+    # Track streaming state
+    live_events = [user_event]
+    current_streaming_text = ""
+    last_render_time = 0
+    RENDER_THROTTLE_MS = 200
+    
+    def render_live():
+        """Render current streaming state."""
+        nonlocal last_render_time
+        current_time = time.time() * 1000
+        if current_time - last_render_time < RENDER_THROTTLE_MS:
+            return
+        last_render_time = current_time
+        
+        try:
+            with container:
+                for evt in live_events[-8:]:
+                    render_inline_message(evt)
+                
+                if current_streaming_text:
+                    display_text = current_streaming_text[-500:] if len(current_streaming_text) > 500 else current_streaming_text
+                    st.markdown(f'''
+                    <div class="chat-msg assistant" style="border-left-color: #2196f3;">
+                        <strong>🤖 AI:</strong> <span style="color: #888;">(正在生成...)</span><br>
+                        <pre style="white-space: pre-wrap; margin: 4px 0 0 0; font-size: 12px;">{display_text}</pre>
+                    </div>
+                    ''', unsafe_allow_html=True)
+        except:
+            pass
+    
+    try:
+        for event in agent.run(message, stream=True):
+            event_type = event.get("type")
+            
+            if event_type == "streaming_delta":
+                current_streaming_text = event.get("accumulated", "")
+                render_live()
+                continue
+            
+            elif event_type == "streaming_complete":
+                content = event.get("content", "")
+                if content:
+                    assistant_event = {"type": "assistant_message", "content": content}
+                    task_manager.add_chat_message(task.id, assistant_event)
+                    live_events.append(assistant_event)
+                current_streaming_text = ""
+                render_live()
+                continue
+            
+            # Convert ToolCallInfo to dict
+            if event_type in ["tool_call", "tool_result"]:
+                tc = event.get("tool_call")
+                if tc and not isinstance(tc, dict):
+                    event = {
+                        "type": event_type,
+                        "tool_call": {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            "result": {
+                                "success": tc.result.success if tc.result else False,
+                                "data": tc.result.data if tc.result else None,
+                                "error": tc.result.error if tc.result else None
+                            } if tc.result else None
+                        }
+                    }
+            
+            task_manager.add_chat_message(task.id, event)
+            live_events.append(event)
+            render_live()
+            
+            # Check for phase transitions
+            if event_type == "tool_result":
+                tc = event.get("tool_call")
+                if tc:
+                    tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                    if tc_name == "write_file":
+                        st.session_state.preview_key += 1
+                        tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                        if tc_args:
+                            files_written = tc_args.get("files", [])
+                            for file_entry in files_written:
+                                file_path = file_entry.get("path", "") if isinstance(file_entry, dict) else ""
+                                if "presentation_plan.json" in file_path:
+                                    handle_phase_complete(task, "architect", "", None)
+                    elif tc_name == "phase_complete":
+                        tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                        if tc_result:
+                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else tc_result.data
+                            if result_data and result_data.get("phase_complete"):
+                                phase = result_data.get("phase", "")
+                                summary = result_data.get("summary", "")
+                                handle_phase_complete(task, phase, summary, None)
+                                st.session_state.is_processing = False
+                                break
+            
+            if not st.session_state.is_processing:
+                break
+    
+    except Exception as e:
+        error_event = {"type": "error", "error": str(e)}
+        task_manager.add_chat_message(task.id, error_event)
+        live_events.append(error_event)
+    
+    finally:
+        st.session_state.is_processing = False
+        st.rerun()
+
+
+def process_user_message_with_dialog(task: Task, message: str):
+    """Process user message and show results in streaming dialog."""
+    st.session_state.is_processing = True
+    
+    agent = get_or_create_agent(task)
+    if agent is None:
+        st.session_state.is_processing = False
+        return
+    
+    task_manager = st.session_state.task_manager
+    
+    # Add user message to dialog content
+    user_event = {"type": "user_message", "content": message}
+    task_manager.add_chat_message(task.id, user_event)
+    st.session_state.streaming_dialog_content.append(user_event)
+    
+    try:
+        for event in agent.run(message, stream=True):
+            event_type = event.get("type")
+            
+            if event_type == "streaming_delta":
+                st.session_state.streaming_current_text = event.get("accumulated", "")
+                continue
+            
+            elif event_type == "streaming_complete":
+                content = event.get("content", "")
+                if content:
+                    assistant_event = {"type": "assistant_message", "content": content}
+                    task_manager.add_chat_message(task.id, assistant_event)
+                    st.session_state.streaming_dialog_content.append(assistant_event)
+                st.session_state.streaming_current_text = ""
+                continue
+            
+            # Convert ToolCallInfo to dict
+            if event_type in ["tool_call", "tool_result"]:
+                tc = event.get("tool_call")
+                if tc and not isinstance(tc, dict):
+                    event = {
+                        "type": event_type,
+                        "tool_call": {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            "result": {
+                                "success": tc.result.success if tc.result else False,
+                                "data": tc.result.data if tc.result else None,
+                                "error": tc.result.error if tc.result else None
+                            } if tc.result else None
+                        }
+                    }
+            
+            task_manager.add_chat_message(task.id, event)
+            st.session_state.streaming_dialog_content.append(event)
+            
+            # Check for phase transitions
+            if event_type == "tool_result":
+                tc = event.get("tool_call")
+                if tc:
+                    tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                    if tc_name == "write_file":
+                        st.session_state.preview_key += 1
+                        tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                        if tc_args:
+                            files_written = tc_args.get("files", [])
+                            for file_entry in files_written:
+                                file_path = file_entry.get("path", "") if isinstance(file_entry, dict) else ""
+                                if "presentation_plan.json" in file_path:
+                                    handle_phase_complete(task, "architect", "", None)
+                    elif tc_name == "phase_complete":
+                        tc_result = tc.get("result") if isinstance(tc, dict) else tc.result
+                        if tc_result:
+                            result_data = tc_result.get("data") if isinstance(tc_result, dict) else tc_result.data
+                            if result_data and result_data.get("phase_complete"):
+                                phase = result_data.get("phase", "")
+                                summary = result_data.get("summary", "")
+                                handle_phase_complete(task, phase, summary, None)
+                                st.session_state.is_processing = False
+                                break
+            
+            if not st.session_state.is_processing:
+                break
+    
+    except Exception as e:
+        error_event = {"type": "error", "error": str(e)}
+        task_manager.add_chat_message(task.id, error_event)
+        st.session_state.streaming_dialog_content.append(error_event)
+    
+    finally:
+        st.session_state.is_processing = False
+        st.rerun()
+
+
+# ============================================================================
 # Main App
 # ============================================================================
 
 def main():
     """Main application entry point."""
-    # Render sidebar
-    render_sidebar()
+    # Initialize session state
+    init_session_state()
     
-    # Sync phase with current task state (handles page refresh, etc.)
+    # Sync phase with current task state
     sync_phase_with_task()
     
-    # Main content area
-    st.title("🎨 AI Presentation Agent")
-    
-    # Route based on current phase
+    # Get current phase
     current_phase = st.session_state.current_phase
     
+    # Route based on phase
     if current_phase in ["designing", "completed"]:
-        # Show grid view for slide monitoring and editing
-        st.caption("幻灯片生成与编辑")
+        # Full-screen grid view for slide editing
         render_grid_view()
     
     elif current_phase == "editing_plan":
-        # Show plan editor
-        st.caption("编辑演示文稿规划")
+        # Plan editor view
         render_plan_editor()
     
     else:
-        # Show chat view for collecting and architect phases
-        st.caption("使用 AI 创建数据驱动的 HTML 演示文稿")
+        # Main collecting/input view - Apple style layout
+        # Two-column layout: 25% left (narrow), 75% right (wide)
+        col_left, col_right = st.columns([1, 3])
         
-        # Create two columns for chat and preview
-        col1, col2 = st.columns([1, 1])
+        with col_left:
+            render_left_panel()
         
-        with col1:
-            render_chat_panel()
+        with col_right:
+            render_right_panel()
         
-        with col2:
-            render_preview_panel()
+        # Footer
+        st.markdown('''
+        <div class="footer-text">
+            <span>提示：内容会在本地保存，便于下次继续。</span>
+            <a href="#" style="color: #64748b;">导出当前配置</a>
+        </div>
+        ''', unsafe_allow_html=True)
     
-    # Processing indicator
+    # Render streaming dialog if active
+    render_streaming_dialog()
+    
+    # Processing indicator toast
     if st.session_state.is_processing:
-        st.toast("🔄 Agent 正在工作...", icon="⏳")
+        st.toast("🔄 AI 正在工作...", icon="⏳")
 
 
 if __name__ == "__main__":
