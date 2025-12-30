@@ -1,0 +1,62 @@
+services:
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-presentation-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - ARCHITECT_MODEL=${ARCHITECT_MODEL:-gpt-4o}
+      - DESIGNER_MODEL=${DESIGNER_MODEL:-gpt-4o}
+      - IMAGE_API_KEY=${IMAGE_API_KEY:-}
+      - IMAGE_API_BASE=${IMAGE_API_BASE:-https://api.openai.com/v1}
+      - IMAGE_MODEL=${IMAGE_MODEL:-dall-e-3}
+      - WORKSPACE_BASE=/app/data/tasks
+      - PROMPTS_DIR=/app/prompts
+      - MAX_CONCURRENT_SLIDES=${MAX_CONCURRENT_SLIDES:-3}
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./data:/app/data
+      - ./backend/prompts:/app/prompts:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Frontend Web Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai-presentation-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy (Optional - for production)
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: ai-presentation-nginx
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - backend
+  #     - frontend
+  #   restart: unless-stopped
+
+volumes:
+  data:
