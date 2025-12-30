@@ -1,7 +1,7 @@
 """HTML export functionality.
 
 This module provides:
-- HTMLExporter: Combine slides into single HTML presentation
+- HTMLExporter: Combine slides into single HTML presentation using iframe loader
 """
 
 import json
@@ -10,14 +10,182 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# Exported Single File Template (iframe-based loader)
+# This approach preserves all CSS, JS, and content from individual slides
+EXPORTED_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        html, body {{
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: white;
+        }}
+        
+        #slide-frame {{
+            width: 100%;
+            height: 100%;
+            border: none;
+            background: white;
+        }}
+        
+        #slide-indicator {{
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            color: #9ca3af;
+            font-size: 14px;
+            font-weight: 400;
+            z-index: 1000;
+            pointer-events: none;
+        }}
+        
+        #loading {{
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            z-index: 999;
+            transition: opacity 0.3s;
+        }}
+        
+        #loading.hidden {{
+            opacity: 0;
+            pointer-events: none;
+        }}
+        
+        .spinner {{
+            width: 40px;
+            height: 40px;
+            border: 3px solid #e5e7eb;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }}
+        
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
+    </style>
+</head>
+<body>
+    <!-- Loading indicator -->
+    <div id="loading">
+        <div class="spinner"></div>
+    </div>
+    
+    <!-- Slide iframe -->
+    <iframe id="slide-frame" src=""></iframe>
+    
+    <!-- Slide indicator -->
+    <div id="slide-indicator">1 / {total_slides}</div>
+    
+    <script>
+        // Slide configuration
+        const slides = {slides_json};
+        const totalSlides = slides.length;
+        let currentSlideIndex = 0;
+        
+        // DOM elements
+        const frame = document.getElementById('slide-frame');
+        const indicator = document.getElementById('slide-indicator');
+        const loading = document.getElementById('loading');
+        
+        // Load a slide
+        function loadSlide(index) {{
+            if (index < 0 || index >= totalSlides) return;
+            
+            loading.classList.remove('hidden');
+            currentSlideIndex = index;
+            
+            // Update iframe src
+            frame.src = slides[index].file;
+            
+            // Update indicator
+            indicator.textContent = `${{index + 1}} / ${{totalSlides}}`;
+        }}
+        
+        // Navigation functions
+        function nextSlide() {{
+            if (currentSlideIndex < totalSlides - 1) {{
+                loadSlide(currentSlideIndex + 1);
+            }}
+        }}
+        
+        function prevSlide() {{
+            if (currentSlideIndex > 0) {{
+                loadSlide(currentSlideIndex - 1);
+            }}
+        }}
+        
+        // Toggle fullscreen
+        function toggleFullscreen() {{
+            if (!document.fullscreenElement) {{
+                document.documentElement.requestFullscreen().catch(err => {{
+                    console.log('Fullscreen error:', err);
+                }});
+            }} else {{
+                document.exitFullscreen();
+            }}
+        }}
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === 'ArrowRight' || e.key === ' ') {{
+                e.preventDefault();
+                nextSlide();
+            }} else if (e.key === 'ArrowLeft') {{
+                e.preventDefault();
+                prevSlide();
+            }} else if (e.key === 'Enter' || e.key === 'F' || e.key === 'f') {{
+                e.preventDefault();
+                toggleFullscreen();
+            }} else if (e.key === 'Home') {{
+                e.preventDefault();
+                loadSlide(0);
+            }} else if (e.key === 'End') {{
+                e.preventDefault();
+                loadSlide(totalSlides - 1);
+            }} else if (e.key === 'Escape' && document.fullscreenElement) {{
+                // Escape is handled by browser for fullscreen exit
+            }}
+        }});
+        
+        // Hide loading when iframe loads
+        frame.addEventListener('load', () => {{
+            loading.classList.add('hidden');
+        }});
+        
+        // Initialize - load first slide
+        loadSlide(0);
+    </script>
+</body>
+</html>
+"""
+
+
 class HTMLExporter:
     """Exports slides as a combined HTML presentation.
     
     Features:
-    - Combines multiple slide HTML files
-    - Adds navigation controls
-    - Supports keyboard navigation
-    - Generates index page
+    - Creates iframe-based presentation loader
+    - Preserves all CSS, JS, and content from individual slides
+    - Adds navigation controls with keyboard support
+    - Supports fullscreen mode
     """
     
     def __init__(self, workspace_path: Path):
@@ -43,16 +211,31 @@ class HTMLExporter:
         
         return sorted(files, key=get_slide_num)
     
+    def get_manifest(self) -> Optional[Dict[str, Any]]:
+        """Read and return the manifest.json file."""
+        manifest_path = self.slides_path / "manifest.json"
+        if not manifest_path.exists():
+            return None
+        try:
+            return json.loads(manifest_path.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+    
     def export_combined(
         self,
         output_path: Optional[Path] = None,
-        title: str = "Presentation"
+        title: str = "Presentation",
+        slides_path_prefix: str = "slides/"
     ) -> Path:
-        """Export all slides as a combined HTML file.
+        """Export all slides as a combined HTML file using iframe loader.
+        
+        This approach preserves all CSS, JS, and content from individual slides,
+        avoiding the issues with content extraction and merging.
         
         Args:
             output_path: Output file path (default: workspace/presentation.html)
             title: Presentation title
+            slides_path_prefix: Prefix for slide file paths (default: "slides/")
             
         Returns:
             Path to exported file
@@ -60,25 +243,44 @@ class HTMLExporter:
         if output_path is None:
             output_path = self.workspace_path / "presentation.html"
         
-        slides = self.get_slide_files()
+        # Read manifest
+        manifest = self.get_manifest()
+        if not manifest:
+            # Fallback to file-based detection
+            slides = self.get_slide_files()
+            if not slides:
+                raise ValueError("No slides found to export")
+            slides_meta = [
+                {"id": f"slide_{i+1}", "title": f"Slide {i+1}", "file": slide.name}
+                for i, slide in enumerate(slides)
+            ]
+            title = "Presentation"
+        else:
+            slides_meta = manifest.get("slides", [])
+            if not slides_meta:
+                raise ValueError("No slides found in manifest")
+            title = manifest.get("title", title)
         
-        if not slides:
-            raise ValueError("No slides found to export")
+        # Build slides array for JavaScript
+        slides_json = json.dumps([
+            {
+                "id": slide.get("id", f"slide_{i+1}"),
+                "title": slide.get("title", f"Slide {i+1}"),
+                "file": f"{slides_path_prefix}{slide.get('file', f'slide_{i+1}.html')}"
+            }
+            for i, slide in enumerate(slides_meta)
+        ], ensure_ascii=False)
         
-        # Read all slide contents
-        slide_contents = []
-        for slide_path in slides:
-            content = slide_path.read_text(encoding="utf-8")
-            # Extract body content
-            body_content = self._extract_body(content)
-            slide_contents.append(body_content)
-        
-        # Generate combined HTML
-        html = self._generate_combined_html(slide_contents, title)
+        # Generate exported HTML
+        exported_html = EXPORTED_HTML_TEMPLATE.format(
+            title=title,
+            slides_json=slides_json,
+            total_slides=len(slides_meta)
+        )
         
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(html, encoding="utf-8")
+        output_path.write_text(exported_html, encoding="utf-8")
         
         return output_path
     
@@ -99,18 +301,33 @@ class HTMLExporter:
         if output_path is None:
             output_path = self.slides_path / "index.html"
         
-        slides = self.get_slide_files()
+        # Try to get slides from manifest first
+        manifest = self.get_manifest()
+        if manifest:
+            slides_meta = manifest.get("slides", [])
+            title = manifest.get("title", title)
+        else:
+            # Fallback to file detection
+            slides = self.get_slide_files()
+            if not slides:
+                raise ValueError("No slides found to export")
+            slides_meta = [
+                {"id": f"slide_{i+1}", "title": f"Slide {i+1}", "file": slide.name}
+                for i, slide in enumerate(slides)
+            ]
         
-        if not slides:
+        if not slides_meta:
             raise ValueError("No slides found to export")
         
         # Generate index HTML
         slide_links = []
-        for i, slide_path in enumerate(slides, 1):
+        for i, slide in enumerate(slides_meta, 1):
+            slide_title = slide.get("title", f"Slide {i}")
+            slide_file = slide.get("file", f"slide_{i}.html")
             slide_links.append(f"""
-                <a href="{slide_path.name}" class="slide-link">
+                <a href="{slide_file}" class="slide-link">
                     <span class="slide-number">{i}</span>
-                    <span class="slide-name">{slide_path.stem}</span>
+                    <span class="slide-name">{slide_title}</span>
                 </a>
             """)
         
@@ -122,7 +339,7 @@ class HTMLExporter:
     <title>{title} - Index</title>
     <style>
         body {{
-            font-family: Arial, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             max-width: 800px;
             margin: 0 auto;
             padding: 20px;
@@ -169,11 +386,25 @@ class HTMLExporter:
         .slide-name {{
             flex: 1;
         }}
+        .open-presentation {{
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+        }}
+        .open-presentation:hover {{
+            background: #0056b3;
+        }}
     </style>
 </head>
 <body>
     <h1>{title}</h1>
-    <p>Total slides: {len(slides)}</p>
+    <p>Total slides: {len(slides_meta)}</p>
+    <a href="../presentation.html" class="open-presentation">▶ Open Presentation</a>
     <div class="slides-grid">
         {"".join(slide_links)}
     </div>
@@ -185,185 +416,3 @@ class HTMLExporter:
         output_path.write_text(html, encoding="utf-8")
         
         return output_path
-    
-    def _extract_body(self, html: str) -> str:
-        """Extract body content from HTML."""
-        # Try to find body content
-        match = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return html
-    
-    def _extract_styles(self, html: str) -> str:
-        """Extract style tags from HTML."""
-        styles = []
-        for match in re.finditer(r'<style[^>]*>(.*?)</style>', html, re.DOTALL | re.IGNORECASE):
-            styles.append(match.group(1))
-        return "\n".join(styles)
-    
-    def _generate_combined_html(
-        self,
-        slide_contents: List[str],
-        title: str
-    ) -> str:
-        """Generate combined presentation HTML."""
-        slides_html = []
-        for i, content in enumerate(slide_contents):
-            slides_html.append(f"""
-                <div class="slide" id="slide-{i+1}" data-slide="{i+1}">
-                    {content}
-                </div>
-            """)
-        
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            background: #1a1a1a;
-            overflow: hidden;
-            font-family: Arial, sans-serif;
-        }}
-        
-        .slide-container {{
-            width: 100vw;
-            height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }}
-        
-        .slide {{
-            width: 1920px;
-            height: 1080px;
-            background: white;
-            display: none;
-            transform-origin: center;
-        }}
-        
-        .slide.active {{
-            display: block;
-        }}
-        
-        .controls {{
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            display: flex;
-            gap: 10px;
-            z-index: 1000;
-        }}
-        
-        .controls button {{
-            padding: 10px 20px;
-            font-size: 16px;
-            cursor: pointer;
-            border: none;
-            border-radius: 5px;
-            background: #007bff;
-            color: white;
-            transition: background 0.2s;
-        }}
-        
-        .controls button:hover {{
-            background: #0056b3;
-        }}
-        
-        .controls button:disabled {{
-            background: #ccc;
-            cursor: not-allowed;
-        }}
-        
-        .slide-counter {{
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            color: white;
-            font-size: 14px;
-            z-index: 1000;
-        }}
-        
-        /* Responsive scaling */
-        @media (max-width: 1920px) {{
-            .slide {{
-                transform: scale(calc(100vw / 1920));
-            }}
-        }}
-        
-        @media (max-height: 1080px) {{
-            .slide {{
-                transform: scale(min(calc(100vw / 1920), calc(100vh / 1080)));
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="slide-container">
-        {"".join(slides_html)}
-    </div>
-    
-    <div class="controls">
-        <button id="prev-btn" onclick="prevSlide()">← Previous</button>
-        <button id="next-btn" onclick="nextSlide()">Next →</button>
-    </div>
-    
-    <div class="slide-counter">
-        <span id="current-slide">1</span> / <span id="total-slides">{len(slide_contents)}</span>
-    </div>
-    
-    <script>
-        let currentSlide = 1;
-        const totalSlides = {len(slide_contents)};
-        
-        function showSlide(n) {{
-            const slides = document.querySelectorAll('.slide');
-            
-            if (n < 1) n = 1;
-            if (n > totalSlides) n = totalSlides;
-            
-            currentSlide = n;
-            
-            slides.forEach(slide => slide.classList.remove('active'));
-            slides[n - 1].classList.add('active');
-            
-            document.getElementById('current-slide').textContent = n;
-            document.getElementById('prev-btn').disabled = n === 1;
-            document.getElementById('next-btn').disabled = n === totalSlides;
-        }}
-        
-        function nextSlide() {{
-            showSlide(currentSlide + 1);
-        }}
-        
-        function prevSlide() {{
-            showSlide(currentSlide - 1);
-        }}
-        
-        // Keyboard navigation
-        document.addEventListener('keydown', (e) => {{
-            if (e.key === 'ArrowRight' || e.key === ' ') {{
-                nextSlide();
-            }} else if (e.key === 'ArrowLeft') {{
-                prevSlide();
-            }} else if (e.key === 'Home') {{
-                showSlide(1);
-            }} else if (e.key === 'End') {{
-                showSlide(totalSlides);
-            }}
-        }});
-        
-        // Initialize
-        showSlide(1);
-    </script>
-</body>
-</html>"""

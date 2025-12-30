@@ -578,9 +578,19 @@ async def modify_slide_with_ai(
 
 
 # Export endpoints
+class ExportOptions(BaseModel):
+    """Options for export."""
+    include_pptx: bool = True
+    include_speech: bool = True
+    include_screenshots: bool = False
+
+
 @router.get("/export/html")
 async def export_html(task_id: str):
-    """Export presentation as combined HTML."""
+    """Export presentation as combined HTML (iframe loader).
+    
+    This creates a presentation.html that loads individual slide files.
+    """
     workspace = get_workspace_path(task_id)
     exporter = HTMLExporter(workspace)
     
@@ -597,7 +607,10 @@ async def export_html(task_id: str):
 
 @router.get("/export/pptx")
 async def export_pptx(task_id: str):
-    """Export presentation as PPTX."""
+    """Export presentation as PPTX.
+    
+    Uses Selenium to take screenshots and python-pptx to create the file.
+    """
     workspace = get_workspace_path(task_id)
     exporter = PPTXExporter(workspace)
     
@@ -615,15 +628,82 @@ async def export_pptx(task_id: str):
 
 
 @router.get("/export/zip")
-async def export_zip(task_id: str):
-    """Export all presentation assets as ZIP."""
+async def export_zip(
+    task_id: str,
+    include_pptx: bool = True,
+    include_speech: bool = True
+):
+    """Export all presentation assets as ZIP.
+    
+    The ZIP package includes:
+    - presentation.html (iframe-based loader)
+    - presentation.pptx (if include_pptx=True and dependencies available)
+    - speech_script.md (if include_speech=True)
+    - speech_coaching.md (if include_speech=True)
+    - slides/ (all slide HTML files)
+    - README.md (keyboard shortcuts and instructions)
+    
+    Args:
+        task_id: Task ID
+        include_pptx: Include PowerPoint file (default: True)
+        include_speech: Include speech script and coaching (default: True)
+    """
+    settings = get_settings()
     workspace = get_workspace_path(task_id)
-    exporter = ZipExporter(workspace)
+    exporter = ZipExporter(workspace, settings=settings)
     
-    output_path = exporter.export()
+    try:
+        # Use return_bytes to avoid file locking issues
+        zip_bytes = exporter.export(
+            include_pptx=include_pptx,
+            include_speech=include_speech,
+            return_bytes=True
+        )
+        
+        from fastapi.responses import Response
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=presentation.zip"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/export/zip")
+async def export_zip_with_options(
+    task_id: str,
+    options: ExportOptions
+):
+    """Export all presentation assets as ZIP with custom options.
     
-    return FileResponse(
-        output_path,
-        media_type="application/zip",
-        filename=output_path.name
-    )
+    This is an alternative to GET /export/zip that accepts options in request body.
+    """
+    settings = get_settings()
+    workspace = get_workspace_path(task_id)
+    exporter = ZipExporter(workspace, settings=settings)
+    
+    try:
+        zip_bytes = exporter.export(
+            include_pptx=options.include_pptx,
+            include_speech=options.include_speech,
+            include_screenshots=options.include_screenshots,
+            return_bytes=True
+        )
+        
+        from fastapi.responses import Response
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=presentation.zip"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

@@ -327,12 +327,38 @@ export default function GenerationPage() {
               >
                 ▶ 启动待生成
               </button>
-              <button 
-                onClick={() => handleExport('pptx')}
-                className="px-4 py-2 border rounded-lg hover:bg-gray-50 flex items-center gap-2 text-sm font-medium"
-              >
-                ⬇ 导出PPTX
-              </button>
+              <div className="relative group">
+                <button
+                  className="px-4 py-2 border rounded-lg hover:bg-gray-50 flex items-center gap-2 text-sm font-medium"
+                >
+                  ⬇ 导出
+                </button>
+                <div className="absolute right-0 top-full mt-2 w-56 bg-white border rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
+                  <div className="p-2 text-xs font-semibold text-gray-500 border-b">导出选项</div>
+                  <button
+                    onClick={() => handleExport('zip')}
+                    className="w-full px-3 py-2 hover:bg-gray-50 text-left flex items-center gap-2 text-sm"
+                  >
+                    📦 完整包 (ZIP)
+                    <span className="text-xs text-gray-400 ml-auto">推荐</span>
+                  </button>
+                  <button
+                    onClick={() => handleExport('html')}
+                    className="w-full px-3 py-2 hover:bg-gray-50 text-left flex items-center gap-2 text-sm"
+                  >
+                    🌐 网页版 (HTML)
+                  </button>
+                  <button
+                    onClick={() => handleExport('pptx')}
+                    className="w-full px-3 py-2 hover:bg-gray-50 text-left flex items-center gap-2 text-sm"
+                  >
+                    📊 PowerPoint (PPTX)
+                  </button>
+                  <div className="border-t p-2 text-xs text-gray-500">
+                    完整包包含: HTML、PPTX、演讲稿
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
