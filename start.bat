@@ -33,11 +33,27 @@ if %errorlevel% neq 0 (
 echo [OK] Docker is available
 echo.
 
+REM Region selection
+echo Please select your region:
+echo   1. International (default)
+echo   2. China Mainland (use mirror sources)
+echo.
+set /p REGION_CHOICE="Enter choice [1/2]: "
+
+set USE_CHINA_MIRROR=false
+if "%REGION_CHOICE%"=="2" (
+    set USE_CHINA_MIRROR=true
+    echo [INFO] Using China mirror sources...
+) else (
+    echo [INFO] Using default sources...
+)
+echo.
+
 REM Build images
 echo [INFO] Building Docker images...
 echo        This may take several minutes on first run...
 echo.
-docker compose build
+docker compose build --build-arg USE_CHINA_MIRROR=%USE_CHINA_MIRROR%
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Build failed!

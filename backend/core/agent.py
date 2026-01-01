@@ -160,21 +160,36 @@ When you need to use a tool, output a JSON object wrapped in special boundary ma
 {{"tool": "tool_name", "parameters": {{...}}}}
 {self.TOOL_CALL_END}
 
-You can call multiple tools by outputting multiple tool blocks:
+**CRITICAL: ONE TOOL PER RESPONSE**
 
+You MUST only call ONE tool at a time. After calling a tool, you MUST wait for the result before deciding your next action.
+
+**WRONG (Do NOT do this):**
+```
 {self.TOOL_CALL_START}
 {{"tool": "read_file", "parameters": {{"path": "file.txt"}}}}
 {self.TOOL_CALL_END}
 
 {self.TOOL_CALL_START}
-{{"tool": "write_file", "parameters": {{"path": "output.txt", "content": "Hello!"}}}}
+{{"tool": "phase_complete", "parameters": {{"phase": "architect", "summary": "Done"}}}}
+{self.TOOL_CALL_END}
+```
+
+**CORRECT:**
+1. Call one tool:
+{self.TOOL_CALL_START}
+{{"tool": "read_file", "parameters": {{"path": "file.txt"}}}}
 {self.TOOL_CALL_END}
 
-**Important:**
+2. Wait for the result, then based on the result, decide your next action.
+
+**Important Rules:**
 - Each tool call must be wrapped in {self.TOOL_CALL_START} and {self.TOOL_CALL_END} markers
 - The content between markers must be a valid JSON object
 - Use proper JSON syntax (double quotes for strings, no trailing commas)
-- After each tool call, wait for the result before proceeding"""
+- **ONLY ONE tool call per response** - wait for the result before calling another tool
+- **NEVER assume a tool will succeed** - always check the result before proceeding
+- If a tool fails, handle the error appropriately before moving to the next step"""
     
     async def chat(
         self,

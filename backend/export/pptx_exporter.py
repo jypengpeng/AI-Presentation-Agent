@@ -2,13 +2,33 @@
 
 This module provides:
 - PPTXExporter: Convert HTML slides to PowerPoint format
+
+Uses Selenium with system Chrome/Chromium for screenshots, which automatically
+inherits system fonts (including Chinese fonts).
+
+Supports parallel screenshot capture for faster export.
 """
 
 import asyncio
+import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Check for Selenium availability
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 
 class PPTXExporter:
@@ -16,7 +36,7 @@ class PPTXExporter:
     
     Features:
     - Converts HTML slides to PPTX
-    - Takes screenshots of HTML for slide images
+    - Takes screenshots of HTML using Selenium (inherits system fonts)
     - Adds speaker notes
     """
     
@@ -43,17 +63,97 @@ class PPTXExporter:
         
         return sorted(files, key=get_slide_num)
     
-    async def take_screenshots(self) -> List[Path]:
-        """Take screenshots of all slides using Playwright.
+    def _create_chrome_options(self, width: int, height: int) -> 'ChromeOptions':
+        """Create Chrome options for headless screenshot."""
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument(f"--window-size={width},{height}")
+        # Force device scale factor for higher quality
+        chrome_options.add_argument("--force-device-scale-factor=2")
+        return chrome_options
+    
+    def _take_single_screenshot(
+        self,
+        slide_path: Path,
+        screenshot_path: Path,
+        width: int,
+        height: int,
+        driver_path: str
+    ) -> Tuple[Path, bool, str]:
+        """Take a screenshot of a single slide.
+        
+        Args:
+            slide_path: Path to the HTML slide
+            screenshot_path: Path to save the screenshot
+            width: Viewport width
+            height: Viewport height
+            driver_path: Path to ChromeDriver
+        
+        Returns:
+            Tuple of (screenshot_path, success, error_message)
+        """
+        driver = None
+        try:
+            chrome_options = self._create_chrome_options(width, height)
+            service = ChromeService(driver_path)
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_window_size(width, height)
+            
+            # Navigate to the slide file
+            file_url = f"file:///{slide_path.resolve().as_posix()}"
+            driver.get(file_url)
+            
+            # Wait for page to load and web fonts
+            time.sleep(1.5)
+            
+            # Try to wait for fonts to be ready
+            try:
+                driver.execute_script("return document.fonts.ready")
+            except Exception:
+                pass  # Ignore if fonts API not available
+            
+            # Take screenshot
+            driver.save_screenshot(str(screenshot_path))
+            logger.info(f"Screenshot saved: {screenshot_path}")
+            return (screenshot_path, True, "")
+            
+        except Exception as e:
+            logger.error(f"Failed to screenshot {slide_path}: {e}")
+            return (screenshot_path, False, str(e))
+            
+        finally:
+            if driver:
+                driver.quit()
+    
+    def take_screenshots_sync(
+        self,
+        width: int = 1920,
+        height: int = 1080,
+        max_workers: int = 4
+    ) -> List[Path]:
+        """Take screenshots of all slides using Selenium in parallel.
+        
+        Uses system Chrome/Chromium which inherits system fonts,
+        avoiding Chinese font display issues.
+        
+        Args:
+            width: Viewport width (default: 1920)
+            height: Viewport height (default: 1080)
+            max_workers: Maximum parallel Chrome instances (default: 4)
         
         Returns:
             List of screenshot paths
+        
+        Raises:
+            RuntimeError: If Selenium is not available
         """
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            raise ImportError(
-                "Playwright not installed. Run: pip install playwright && playwright install"
+        if not SELENIUM_AVAILABLE:
+            raise RuntimeError(
+                "Selenium is not installed. Please run:\n"
+                "  pip install selenium webdriver-manager"
             )
         
         slides = self.get_slide_files()
@@ -61,26 +161,58 @@ class PPTXExporter:
             return []
         
         self.screenshots_path.mkdir(parents=True, exist_ok=True)
-        screenshot_paths = []
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page(
-                viewport={"width": 1920, "height": 1080}
-            )
-            
-            for slide_path in slides:
-                screenshot_path = self.screenshots_path / f"{slide_path.stem}.png"
-                
-                file_url = f"file://{slide_path.resolve()}"
-                await page.goto(file_url, wait_until="networkidle")
-                await page.screenshot(path=str(screenshot_path))
-                
-                screenshot_paths.append(screenshot_path)
-            
-            await browser.close()
+        logger.info(f"Taking screenshots of {len(slides)} slides in parallel (max {max_workers} workers)...")
         
-        return screenshot_paths
+        # Pre-install ChromeDriver once (shared by all workers)
+        driver_path = ChromeDriverManager().install()
+        
+        # Prepare tasks
+        tasks = [
+            (slide_path, self.screenshots_path / f"{slide_path.stem}.png")
+            for slide_path in slides
+        ]
+        
+        # Execute in parallel
+        screenshot_results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._take_single_screenshot,
+                    slide_path,
+                    screenshot_path,
+                    width,
+                    height,
+                    driver_path
+                ): (slide_path, screenshot_path)
+                for slide_path, screenshot_path in tasks
+            }
+            
+            for future in as_completed(futures):
+                screenshot_path, success, error = future.result()
+                if success:
+                    screenshot_results.append(screenshot_path)
+                else:
+                    logger.warning(f"Screenshot failed: {screenshot_path}")
+        
+        # Sort results by slide number
+        def get_slide_num(path: Path) -> int:
+            match = re.search(r'slide_(\d+)', path.stem)
+            return int(match.group(1)) if match else 0
+        
+        screenshot_results.sort(key=get_slide_num)
+        
+        logger.info(f"Created {len(screenshot_results)} screenshots")
+        return screenshot_results
+    
+    async def take_screenshots(self) -> List[Path]:
+        """Take screenshots of all slides (async wrapper).
+        
+        Returns:
+            List of screenshot paths
+        """
+        # Run sync version in thread pool
+        return await asyncio.to_thread(self.take_screenshots_sync)
     
     async def export(
         self,

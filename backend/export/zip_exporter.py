@@ -4,6 +4,7 @@ This module provides:
 - ZipExporter: Package all presentation assets into a ZIP file
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -54,151 +55,41 @@ class ZipExporter:
         except Exception:
             return None
     
-    def _screenshot_slides(self) -> List[Path]:
-        """Take screenshots of all slide HTML files using Selenium.
+    async def _generate_pptx(self) -> Optional[Path]:
+        """Generate PPTX file using PPTXExporter.
         
         Returns:
-            List of paths to screenshot files
+            Path to PPTX file, or None if failed
         """
         try:
-            from selenium import webdriver
-            from selenium.webdriver.chrome.service import Service as ChromeService
-            from selenium.webdriver.chrome.options import Options as ChromeOptions
-            from webdriver_manager.chrome import ChromeDriverManager
-        except ImportError:
-            logger.warning(
-                "Selenium not installed. Run: pip install selenium webdriver-manager"
-            )
-            return []
-        
-        # Determine output directory
-        output_dir = self.workspace_path / "screenshots"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Read manifest to get slide order
-        manifest = self._get_manifest()
-        if not manifest:
-            logger.warning("Manifest not found, cannot take screenshots")
-            return []
-        
-        slides_meta = manifest.get("slides", [])
-        screenshot_paths = []
-        
-        width = 1920
-        height = 1080
-        
-        logger.info(f"Taking screenshots of {len(slides_meta)} slides using Selenium...")
-        
-        # Configure Chrome options for headless mode
-        chrome_options = ChromeOptions()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument(f"--window-size={width},{height}")
-        # Force device scale factor for higher quality
-        chrome_options.add_argument("--force-device-scale-factor=2")
-        
-        driver = None
-        try:
-            # Auto-install ChromeDriver
-            service = ChromeService(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.set_window_size(width, height)
+            from export.pptx_exporter import PPTXExporter
             
-            import time
-            
-            for i, slide_meta in enumerate(slides_meta):
-                slide_file = slide_meta.get("file", f"slide_{i+1}.html")
-                slide_path = self.slides_path / slide_file
-                
-                if not slide_path.exists():
-                    logger.warning(f"Slide file not found: {slide_path}")
-                    continue
-                
-                # Navigate to the slide file
-                file_url = f"file:///{slide_path.resolve().as_posix()}"
-                driver.get(file_url)
-                
-                # Wait a bit for any animations/transitions to complete
-                time.sleep(0.8)
-                
-                # Take screenshot
-                screenshot_name = f"slide_{i+1:03d}.png"
-                screenshot_path = output_dir / screenshot_name
-                driver.save_screenshot(str(screenshot_path))
-                
-                screenshot_paths.append(screenshot_path)
-                logger.info(f"Screenshot saved: {screenshot_path}")
-                
+            exporter = PPTXExporter(self.workspace_path)
+            pptx_path = await exporter.export()
+            return pptx_path
+        except ImportError as e:
+            logger.warning(f"PPTX export dependencies not available: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Error taking screenshots: {e}")
-        finally:
-            if driver:
-                driver.quit()
-        
-        logger.info(f"Created {len(screenshot_paths)} screenshots in {output_dir}")
-        return screenshot_paths
+            logger.error(f"Error generating PPTX: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
-    def _create_pptx_from_screenshots(
-        self,
-        screenshot_paths: List[Path],
-        output_path: Path,
-        title: str = "Presentation"
-    ) -> Optional[Path]:
-        """Create a PowerPoint file from slide screenshots.
-        
-        Args:
-            screenshot_paths: List of paths to screenshot images
-            output_path: Output path for the PPTX file
-            title: Title for the presentation
+    def _get_screenshot_paths(self) -> List[Path]:
+        """Get existing screenshot paths.
         
         Returns:
-            Path to the created PPTX file, or None if failed
+            List of screenshot file paths
         """
-        try:
-            from pptx import Presentation
-            from pptx.util import Inches
-        except ImportError:
-            logger.warning(
-                "python-pptx not installed. Run: pip install python-pptx"
-            )
-            return None
+        screenshots_path = self.workspace_path / "screenshots"
+        if not screenshots_path.exists():
+            return []
         
-        try:
-            # Create presentation with 16:9 aspect ratio
-            prs = Presentation()
-            prs.slide_width = Inches(13.333)  # 16:9 at standard size
-            prs.slide_height = Inches(7.5)
-            
-            # Blank slide layout (index 6 is typically blank)
-            blank_layout = prs.slide_layouts[6]
-            
-            for screenshot_path in screenshot_paths:
-                if not screenshot_path.exists():
-                    logger.warning(f"Screenshot not found: {screenshot_path}")
-                    continue
-                
-                # Add a blank slide
-                slide = prs.slides.add_slide(blank_layout)
-                
-                # Add the screenshot as a full-slide background image
-                slide.shapes.add_picture(
-                    str(screenshot_path),
-                    Inches(0),
-                    Inches(0),
-                    width=prs.slide_width,
-                    height=prs.slide_height
-                )
-            
-            # Save the presentation
-            prs.save(str(output_path))
-            logger.info(f"Created PPTX: {output_path}")
-            
-            return output_path
-        except Exception as e:
-            logger.error(f"Error creating PPTX: {e}")
-            return None
+        import re
+        paths = list(screenshots_path.glob("slide_*.png"))
+        paths.sort(key=lambda p: int(re.search(r'slide_(\d+)', p.stem).group(1)) if re.search(r'slide_(\d+)', p.stem) else 0)
+        return paths
     
     def _generate_speech_materials(
         self
@@ -304,12 +195,44 @@ class ZipExporter:
         include_speech: bool = True,
         return_bytes: bool = False
     ) -> Union[Path, bytes]:
+        """Export all assets as a ZIP file (sync wrapper).
+        
+        This is a synchronous wrapper around export_async.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        return loop.run_until_complete(
+            self.export_async(
+                output_path=output_path,
+                include_html=include_html,
+                include_pptx=include_pptx,
+                include_screenshots=include_screenshots,
+                include_plan=include_plan,
+                include_speech=include_speech,
+                return_bytes=return_bytes
+            )
+        )
+    
+    async def export_async(
+        self,
+        output_path: Optional[Path] = None,
+        include_html: bool = True,
+        include_pptx: bool = True,
+        include_screenshots: bool = True,
+        include_plan: bool = True,
+        include_speech: bool = True,
+        return_bytes: bool = False
+    ) -> Union[Path, bytes]:
         """Export all assets as a ZIP file.
         
         Args:
             output_path: Output ZIP file path
             include_html: Include HTML slides and combined presentation
-            include_pptx: Include PPTX file (requires screenshots)
+            include_pptx: Include PPTX file (requires Playwright)
             include_screenshots: Include screenshots
             include_plan: Include presentation plan
             include_speech: Include speech script and coaching
@@ -345,26 +268,25 @@ class ZipExporter:
                 except Exception as e:
                     logger.warning(f"Failed to generate HTML: {e}")
             
-            # Generate PPTX if requested
+            # Generate PPTX if requested (uses Playwright for screenshots)
             pptx_path = None
-            screenshot_paths = []
-            if include_pptx or include_screenshots:
+            if include_pptx:
                 try:
-                    logger.info("Generating screenshots for PPTX...")
-                    screenshot_paths = self._screenshot_slides()
-                    
-                    if screenshot_paths and include_pptx:
-                        logger.info("Creating PPTX from screenshots...")
+                    logger.info("Generating PPTX with screenshots...")
+                    generated_pptx = await self._generate_pptx()
+                    if generated_pptx and generated_pptx.exists():
+                        # Copy to temp directory
                         pptx_path = tmp_path / "presentation.pptx"
-                        self._create_pptx_from_screenshots(
-                            screenshot_paths,
-                            output_path=pptx_path,
-                            title=title
-                        )
+                        import shutil
+                        shutil.copy2(generated_pptx, pptx_path)
+                        logger.info(f"PPTX generated: {pptx_path}")
                 except Exception as e:
                     logger.warning(f"Failed to generate PPTX: {e}")
                     import traceback
                     traceback.print_exc()
+            
+            # Get screenshot paths for inclusion
+            screenshot_paths = self._get_screenshot_paths() if include_screenshots else []
             
             # Generate speech materials if requested
             speech_script = None

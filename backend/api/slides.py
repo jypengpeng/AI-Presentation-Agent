@@ -637,7 +637,7 @@ async def export_zip(
     
     The ZIP package includes:
     - presentation.html (iframe-based loader)
-    - presentation.pptx (if include_pptx=True and dependencies available)
+    - presentation.pptx (if include_pptx=True and Playwright is installed)
     - speech_script.md (if include_speech=True)
     - speech_coaching.md (if include_speech=True)
     - slides/ (all slide HTML files)
@@ -653,8 +653,8 @@ async def export_zip(
     exporter = ZipExporter(workspace, settings=settings)
     
     try:
-        # Use return_bytes to avoid file locking issues
-        zip_bytes = exporter.export(
+        # Use async export with return_bytes to avoid file locking issues
+        zip_bytes = await exporter.export_async(
             include_pptx=include_pptx,
             include_speech=include_speech,
             return_bytes=True
@@ -689,7 +689,7 @@ async def export_zip_with_options(
     exporter = ZipExporter(workspace, settings=settings)
     
     try:
-        zip_bytes = exporter.export(
+        zip_bytes = await exporter.export_async(
             include_pptx=options.include_pptx,
             include_speech=options.include_speech,
             include_screenshots=options.include_screenshots,

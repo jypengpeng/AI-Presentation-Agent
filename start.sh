@@ -24,9 +24,26 @@ if grep -q "your_openai_api_key_here" .env; then
     exit 1
 fi
 
+# Region selection
+echo ""
+echo "Please select your region:"
+echo "  1. International (default)"
+echo "  2. China Mainland (use mirror sources / 使用国内镜像源)"
+echo ""
+read -p "Enter choice [1/2]: " REGION_CHOICE
+
+USE_CHINA_MIRROR="false"
+if [ "$REGION_CHOICE" = "2" ]; then
+    USE_CHINA_MIRROR="true"
+    echo "🌏 Using China mirror sources..."
+else
+    echo "🌍 Using default sources..."
+fi
+echo ""
+
 # Build and start containers
 echo "🔨 Building Docker images..."
-docker-compose build
+docker-compose build --build-arg USE_CHINA_MIRROR=$USE_CHINA_MIRROR
 
 echo "🚀 Starting services..."
 docker-compose up -d

@@ -124,6 +124,8 @@ pip install -r requirements.txt
 python run.py
 ```
 
+> 💡 PPT 导出使用 Selenium + 系统 Chrome，自动继承系统字体（包括中文字体），无需额外配置。
+
 ### 前端开发
 
 ```bash
